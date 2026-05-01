@@ -4,6 +4,7 @@ title: "AurumFlow"
 abstract: "Experimental tools for geometry exploration, optimization, CFD export, and particle validation of a compact hydraulic classifier/cyclone for small-scale alluvial gold separation."
 authors:
   - given-names: "Daniel"
+    family-names: "Galleguillos"
 license: "GPL-3.0-or-later"
 repository-code: "https://github.com/danielgalleg/AurumFlow"
 keywords:
