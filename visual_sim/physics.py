@@ -50,7 +50,7 @@ def _allowed_radius_for_y(y: np.ndarray, g: ClassifierGeometry) -> np.ndarray:
 @dataclass(frozen=True)
 class SimulationConfig:
     particle_count: int = 8_000
-    dt_s: float = 0.004
+    dt_s: float = 0.003
     seed: int = 7
     max_particle_radius_m: float = 0.0024
     feed_duration_s: float = 5.0
@@ -223,12 +223,31 @@ class ClassifierSimulation:
         )
         target_velocity[:, 0] += centrifugal_slip * radial_x
         target_velocity[:, 2] += centrifugal_slip * radial_z
+        
+        # Numerical artifact correction: explicit Euler integration of circular
+        # motion adds a spurious outward radial drift of approx 0.5 * v_theta^2 * dt / r.
+        # We subtract this from the target velocity so particles don't artificially
+        # resist the inward fluid suction.
+        spurious_drift = 0.5 * tangential_speed**2 * self.config.dt_s / np.maximum(radial, 1e-3)
+        target_velocity[:, 0] -= spurious_drift * radial_x
+        target_velocity[:, 2] -= spurious_drift * radial_z
+
         target_velocity[:, 1] -= settling
         target_velocity += granular_velocity
 
         alpha = self._drag_alpha_schiller_naumann(vel, target_velocity, density, diameter)
-        noise = self.rng.normal(0.0, self.geometry.turbulence, size=vel.shape).astype(np.float32)
-        noise[:, 0] += self.rng.normal(0.0, self.geometry.turbulence * 4.0, size=vel.shape[0])
+        # Localised turbulence amplifier under the vortex finder, where the
+        # contraction of streamlines into the overflow tube generates intense
+        # eddies that physically break orbital trapping.
+        mouth_dist = pos[:, 1] - self.geometry.overflow_tube_bottom_height_m
+        mouth_kernel = np.exp(-(mouth_dist / 0.040) ** 2)
+        turb_scale = self.geometry.turbulence * (1.0 + 4.0 * mouth_kernel)
+        noise = self.rng.normal(0.0, 1.0, size=vel.shape).astype(np.float32) * turb_scale[:, None]
+        # Extra radial component captures the strong cross-flow eddies typical
+        # of cyclone short-circuit zones.
+        noise[:, 0] += self.rng.normal(0.0, 1.0, size=vel.shape[0]).astype(np.float32) * (
+            turb_scale * 3.0
+        )
         vel += (target_velocity - vel) * alpha[:, None] + noise * np.sqrt(self.config.dt_s)
         pos += vel * self.config.dt_s
 
@@ -346,7 +365,11 @@ class ClassifierSimulation:
         inlet_height_norm = np.clip(g.inlet_height_m / g.height_m, 0.0, 1.0)
         inlet_zone = np.exp(-((y - g.inlet_height_m) ** 2) / max(1e-6, (0.11 * g.height_m) ** 2))
 
-        forced_vortex_radius = max(0.4 * g.overflow_tube_radius_m, 0.5e-3)
+        # Burgers-Rott vortex: v_theta = Gamma/(2 pi r) * (1 - exp(-(r/r_core)^2))
+        # The viscous core merges with the vortex finder bore so the tangential
+        # velocity stays bounded at the axis instead of diverging like a pure
+        # free vortex would.
+        viscous_core_radius = max(g.overflow_tube_radius_m, 1e-3)
         circulation_inlet_radius = max(0.6 * g.body_top_radius_m, g.overflow_tube_radius_m * 2.0)
         circulation = (
             2.0
@@ -355,9 +378,13 @@ class ClassifierSimulation:
             * g.inlet_velocity_m_s
             * np.clip(g.deflector_strength, 0.05, 1.5)
         )
-        forced_vortex = circulation * safe_radial / (2.0 * np.pi * forced_vortex_radius ** 2)
         free_vortex = circulation / (2.0 * np.pi * safe_radial)
-        tangential_speed = np.where(radial <= forced_vortex_radius, forced_vortex, free_vortex)
+        viscous_factor = 1.0 - np.exp(-((safe_radial / viscous_core_radius) ** 2))
+        tangential_speed = free_vortex * viscous_factor
+        # Cap the tangential speed: in real cyclones turbulent dissipation
+        # keeps the swirl from reaching the inviscid free-vortex limit close
+        # to the axis. ~1.2x inlet velocity matches typical LDV measurements.
+        tangential_speed = np.minimum(tangential_speed, 1.2 * g.inlet_velocity_m_s)
         height_envelope = np.clip(
             np.minimum(y_norm / max(0.05, inlet_height_norm * 0.6), 1.0)
             * np.clip((1.0 - y_norm) / max(0.05, 1.0 - inlet_height_norm), 0.0, 1.0)
@@ -368,47 +395,81 @@ class ClassifierSimulation:
         tangential_speed *= height_envelope
         tangential_speed += 0.45 * g.inlet_velocity_m_s * inlet_zone
 
-        # Continuous radial split between central upflow and annular downflow,
-        # with a smooth transition that respects volumetric continuity through
-        # the cyclone cross-section.
-        upflow_envelope_radius = np.maximum(0.40 * local_radius, 2.0 * g.overflow_tube_radius_m)
+        # The central upflow sits inside the vortex finder core. The envelope
+        # is wider in the body (so feeds reaching r ~ tube_radius are still in
+        # the upflow zone) and contracts towards the trap apex, mimicking the
+        # acceleration of the air-core through a real cyclone cone.
+        envelope_floor = g.overflow_tube_radius_m
+        envelope_ceiling = 2.0 * g.overflow_tube_radius_m
+        upflow_envelope_radius = np.clip(0.5 * local_radius, envelope_floor, envelope_ceiling)
         upflow_norm = radial / np.maximum(upflow_envelope_radius, 1e-6)
-        upflow_weight = np.exp(-(upflow_norm**3))
-        # Volumetric balance: downflow * annulus_area = upflow * core_area.
+        # A super-Gaussian profile (n=4) keeps the central core well-defined
+        # while quickly transitioning into the descending annulus, eliminating
+        # the wide "saddle" radius where upflow and downflow used to cancel.
+        upflow_weight = np.exp(-(upflow_norm**4))
         body_area = np.pi * max(g.body_top_radius_m, 1e-6) ** 2
-        tube_area = np.pi * max(g.overflow_tube_radius_m, 1e-6) ** 2
-        annulus_area = max(body_area - tube_area, 1e-6)
-        downflow_speed = g.upward_velocity_m_s * tube_area / annulus_area
+        mean_envelope = max(envelope_floor, 0.5 * (envelope_floor + envelope_ceiling))
+        core_integral_area = np.pi * mean_envelope ** 2
+        annulus_area = max(body_area - core_integral_area, 1e-6)
+        inlet_flow_rate = g.inlet_velocity_m_s * 0.05 * body_area
+        # The primary downflow is usually stronger than the net volumetric feed
+        # because of internal recirculation. We boost it to ensure heavy particles
+        # are flushed down efficiently.
+        downflow_speed = 2.5 * inlet_flow_rate / annulus_area
+        # Vertical activation of the core upflow.
         reversal_zone = np.clip(
-            (y - 0.25 * g.trap_height_m)
+            0.18
+            + 0.82
+            * (y - 0.25 * g.trap_height_m)
             / max(1e-6, g.overflow_tube_bottom_height_m - 0.25 * g.trap_height_m),
             0.0,
             1.0,
         )
-        inner_upflow = g.upward_velocity_m_s * upflow_weight * reversal_zone
-        outer_downflow = -downflow_speed * (1.0 - upflow_weight)
-        mouth_zone = np.exp(
+        # Above the mouth, upflow is confined strictly to the tube bore.
+        # Below the mouth, the upflow core exists. To prevent particles from
+        # getting permanently trapped in a bounce ring exactly at the mouth plane
+        # (where upflow abruptly vanishes outside the bore), we allow a very
+        # small residual upflow outside the tube that quickly decays, while
+        # the strong outer_downflow dominates.
+        above_mouth = (y >= g.overflow_tube_bottom_height_m).astype(np.float32)
+        inside_bore_axial = (radial <= g.overflow_tube_radius_m).astype(np.float32)
+        core_active = (1.0 - above_mouth) + above_mouth * inside_bore_axial
+        # Downflow occupies the annulus. It is active everywhere except inside
+        # the ascending core below the mouth, and inside the tube bore above it.
+        # Above the mouth, the entire annulus outside the tube bore is pure
+        # downflow (unaffected by the upflow_weight which is only meant to
+        # split the flows below the mouth).
+        inner_upflow = g.upward_velocity_m_s * upflow_weight * reversal_zone * core_active
+        downflow_profile = (1.0 - above_mouth) * (1.0 - upflow_weight) + above_mouth * (1.0 - inside_bore_axial)
+        outer_downflow = -downflow_speed * downflow_profile
+        axial_velocity = outer_downflow + inner_upflow
+
+        # Radial inflow toward the core: dominated by the volumetric flow that
+        # must traverse a cylinder of radius r at every height to feed the core
+        # upflow. v_r ~ Q_in / (2 pi r dz_active).
+        active_height = max(g.overflow_tube_bottom_height_m - 0.25 * g.trap_height_m, 1e-3)
+        inflow_speed_at_radius = inlet_flow_rate / (2.0 * np.pi * np.maximum(radial, 1e-3) * active_height)
+        # The vortex finder mouth establishes a low-pressure core that pulls
+        # fluid radially inward across the annular space above and below the
+        # mouth height. Below the mouth it decays smoothly so sedimentation
+        # can still occur; above the mouth the suction stays active because
+        # the entire fluid feeding the tube has to converge to the bore.
+        below_mouth = y < g.overflow_tube_bottom_height_m
+        mouth_below = np.exp(
             -((y - g.overflow_tube_bottom_height_m) ** 2)
             / max(1e-6, (0.10 * g.height_m) ** 2)
         )
-        short_circuit = (
-            0.40
-            * g.upward_velocity_m_s
-            * mouth_zone
-            * upflow_weight
-        )
-        axial_velocity = outer_downflow + inner_upflow + short_circuit
-
-        # Continuity-driven radial inflow toward the central upflow region.
-        area_ratio = np.clip((local_radius / np.maximum(g.body_top_radius_m, 1e-6)) ** 2, 0.20, 1.6)
-        continuity_draw = g.upward_velocity_m_s / np.maximum(area_ratio, 0.2)
-        inward_speed = (
-            0.30 * continuity_draw * (0.25 + 0.75 * radius_norm)
-            + 0.10
-            * g.inlet_velocity_m_s
-            * mouth_zone
-            * np.exp(-((radial / np.maximum(1e-6, 2.2 * upflow_envelope_radius)) ** 4))
-        )
+        mouth_zone = np.where(below_mouth, mouth_below, 1.0)
+        # Capture kernel reaches well into the body so particles in the
+        # downcomer annulus are diverted toward the core rather than being
+        # lost to the trap. The kernel vanishes inside the tube bore so the
+        # suction never pushes particles through the tube wall.
+        outside_tube_bore = radial >= g.overflow_tube_radius_m
+        capture_kernel = np.exp(
+            -((radial / max(1e-6, 0.55 * g.body_top_radius_m)) ** 2)
+        ) * outside_tube_bore.astype(np.float32)
+        mouth_boost = 0.6 * g.inlet_velocity_m_s * mouth_zone * capture_kernel
+        inward_speed = inflow_speed_at_radius * (1.0 - upflow_weight) + mouth_boost
         stream_spread = 0.010 * swirl_bias * inlet_zone
 
         fluid = np.zeros_like(pos)
@@ -455,17 +516,37 @@ class ClassifierSimulation:
     ) -> None:
         g = self.geometry
         radial = np.sqrt(pos[:, 0] ** 2 + pos[:, 2] ** 2)
-        capture_radius = 1.25 * g.overflow_tube_radius_m
-        entered_capture_stream = (
+        previous_radial = np.sqrt(previous_pos[:, 0] ** 2 + previous_pos[:, 2] ** 2)
+        capture_radius = g.overflow_tube_radius_m
+        # Capture band: the small region around the vortex finder mouth where
+        # the suction can pull a particle laterally into the tube bore. Above
+        # this band the tube wall is treated as solid.
+        capture_band_height = 0.06 * g.height_m
+        in_capture_band = (
+            np.abs(pos[:, 1] - g.overflow_tube_bottom_height_m) < capture_band_height
+        )
+        # Membership is granted when the particle: (a) crosses the mouth plane
+        # from below into the bore, (b) was already inside the bore last step
+        # (sticky state), or (c) crosses the bore wall while located inside
+        # the capture band.
+        crossing_mouth = (
             (previous_pos[:, 1] < g.overflow_tube_bottom_height_m)
             & (pos[:, 1] >= g.overflow_tube_bottom_height_m)
             & (radial <= capture_radius)
         )
-        inside_capture_stream = (
-            (pos[:, 1] >= g.overflow_tube_bottom_height_m)
+        already_inside_bore = (
+            (previous_pos[:, 1] >= g.overflow_tube_bottom_height_m)
+            & (previous_radial <= capture_radius)
+            & (pos[:, 1] >= g.overflow_tube_bottom_height_m)
             & (radial <= capture_radius)
         )
-        self._inside_overflow_tube[active_indices[entered_capture_stream | inside_capture_stream]] = True
+        crossed_wall_in_band = (
+            in_capture_band
+            & (previous_radial > capture_radius)
+            & (radial <= capture_radius)
+        )
+        captured = crossing_mouth | already_inside_bore | crossed_wall_in_band
+        self._inside_overflow_tube[active_indices[captured]] = True
 
     def _collide_with_overflow_tube(
         self,
@@ -484,37 +565,56 @@ class ClassifierSimulation:
         normal_x[near_axis] = 1.0
         normal_z[near_axis] = 0.0
 
-        blocked_by_outer_pipe_wall = tube_zone & ~inside_tube & (radial < g.overflow_tube_radius_m)
-
-        outer_pipe_shell = (
-            tube_zone
-            & ~inside_tube
-            & (radial >= g.overflow_tube_radius_m)
-            & (radial < g.overflow_tube_radius_m * 1.65)
-        )
-        if np.any(outer_pipe_shell):
-            vel[outer_pipe_shell, 1] = np.minimum(vel[outer_pipe_shell, 1], -0.025)
-
-        if np.any(blocked_by_outer_pipe_wall):
-            pos[blocked_by_outer_pipe_wall, 0] = normal_x[blocked_by_outer_pipe_wall] * (
-                g.overflow_tube_radius_m + 1e-4
+        # Particles that tunnelled through the outer pipe wall in the last
+        # step end up with radius < tube_radius without being marked as
+        # belonging to the overflow stream. Push them back outside the wall
+        # and reflect their inward radial velocity so they cannot keep
+        # crossing the wall on subsequent steps.
+        wall_penetration = tube_zone & ~inside_tube & (radial < g.overflow_tube_radius_m)
+        if np.any(wall_penetration):
+            pos[wall_penetration, 0] = normal_x[wall_penetration] * (
+                g.overflow_tube_radius_m + 5e-4
             )
-            pos[blocked_by_outer_pipe_wall, 2] = normal_z[blocked_by_outer_pipe_wall] * (
-                g.overflow_tube_radius_m + 1e-4
+            pos[wall_penetration, 2] = normal_z[wall_penetration] * (
+                g.overflow_tube_radius_m + 5e-4
             )
             radial_velocity = (
-                vel[blocked_by_outer_pipe_wall, 0] * normal_x[blocked_by_outer_pipe_wall]
-                + vel[blocked_by_outer_pipe_wall, 2] * normal_z[blocked_by_outer_pipe_wall]
+                vel[wall_penetration, 0] * normal_x[wall_penetration]
+                + vel[wall_penetration, 2] * normal_z[wall_penetration]
             )
-            vel[blocked_by_outer_pipe_wall, 0] -= 1.4 * radial_velocity * normal_x[
-                blocked_by_outer_pipe_wall
-            ]
-            vel[blocked_by_outer_pipe_wall, 2] -= 1.4 * radial_velocity * normal_z[
-                blocked_by_outer_pipe_wall
-            ]
-            vel[blocked_by_outer_pipe_wall, 1] = np.minimum(
-                vel[blocked_by_outer_pipe_wall, 1], -0.035
+            inward = radial_velocity < 0.0
+            mask = np.where(wall_penetration)[0][inward]
+            vel[mask, 0] -= 1.8 * radial_velocity[inward] * normal_x[mask]
+            vel[mask, 2] -= 1.8 * radial_velocity[inward] * normal_z[mask]
+
+        # Particles outside the tube wall, above the capture band: damp any
+        # inward radial velocity so they slide along the wall down towards
+        # the mouth instead of pushing through. Inside the capture band the
+        # tube wall is permeable so the suction can pull particles in.
+        capture_band_height = 0.06 * g.height_m
+        above_capture_band = pos[:, 1] >= (
+            g.overflow_tube_bottom_height_m + capture_band_height
+        )
+        outer_pipe_skin = (
+            tube_zone
+            & above_capture_band
+            & ~inside_tube
+            & (radial >= g.overflow_tube_radius_m)
+            & (radial < g.overflow_tube_radius_m * 1.25)
+        )
+        if np.any(outer_pipe_skin):
+            radial_velocity_skin = (
+                vel[outer_pipe_skin, 0] * normal_x[outer_pipe_skin]
+                + vel[outer_pipe_skin, 2] * normal_z[outer_pipe_skin]
             )
+            inward = radial_velocity_skin < 0.0
+            skin_indices = np.where(outer_pipe_skin)[0]
+            inward_indices = skin_indices[inward]
+            vel[inward_indices, 0] -= radial_velocity_skin[inward] * normal_x[inward_indices]
+            vel[inward_indices, 2] -= radial_velocity_skin[inward] * normal_z[inward_indices]
+            # Mild downward bias so particles slide off the tube exterior
+            # rather than stagnating in front of the wall.
+            vel[outer_pipe_skin, 1] = np.minimum(vel[outer_pipe_skin, 1], -0.100)
 
         hit_inner_pipe_wall = tube_zone & inside_tube & (radial > g.overflow_tube_radius_m)
         if np.any(hit_inner_pipe_wall):
