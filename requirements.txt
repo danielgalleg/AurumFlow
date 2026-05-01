@@ -1,0 +1,7 @@
+taichi
+numpy
+imageio[ffmpeg]
+gymnasium
+stable-baselines3
+pandas
+

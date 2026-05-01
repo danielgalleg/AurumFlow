@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this project, please cite it using the metadata in this file."
+title: "AurumFlow"
+abstract: "Experimental tools for geometry exploration, optimization, CFD export, and particle validation of a compact hydraulic classifier/cyclone for small-scale alluvial gold separation."
+authors:
+  - given-names: "Daniel"
+license: "GPL-3.0-or-later"
+repository-code: "https://github.com/danielgalleg/AurumFlow"
+keywords:
+  - "OpenFOAM"
+  - "CFD"
+  - "particle tracking"
+  - "genetic algorithm"
+  - "gold separation"
+  - "hydraulic classifier"
+  - "cyclone"
+date-released: "2026-04-30"
+version: "0.1.0"

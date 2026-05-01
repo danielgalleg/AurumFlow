@@ -1,0 +1,34 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local UI/runtime artifacts
+.cursor/
+imgui.ini
+AI_CONTEXT.md
+*.mp4
+*.avi
+*.mkv
+*.webm
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+recordings/
+
+# Local/reference material not cleared for public redistribution
+2022-SA-NeighborhoodSearch.pdf
+
+# Generated optimization and CFD outputs
+rl_runs/
+cfd_exports/
+cfd_cases/
+cfd_particle_cases/
+cfd_sweeps/
+
+# OpenFOAM generated internals if cases are copied elsewhere
+processor*/
+postProcessing/
+*.log
