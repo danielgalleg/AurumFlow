@@ -53,9 +53,9 @@ class SimulationConfig:
     dt_s: float = 0.004
     seed: int = 7
     max_particle_radius_m: float = 0.0024
-    velocity_relaxation_s: float = 0.08
-    settling_scale: float = 0.032
     feed_duration_s: float = 5.0
+    use_hindrance: bool = True
+    feed_solid_volume_fraction: float = 0.01
 
 
 class ClassifierSimulation:
@@ -195,36 +195,41 @@ class ClassifierSimulation:
         shape = self._shape_factor[active]
 
         fluid = self._fluid_velocity(pos, self._swirl_bias[active])
-        settling = self._settling_velocity(density, diameter, shape)
-        density_response = (WATER_DENSITY_KG_M3 / np.maximum(density, 1.0)) ** 0.50
-        size_response = (150e-6 / np.maximum(diameter, 1e-9)) ** 0.35
-        flow_response = np.clip(1.2 * density_response * size_response, 0.10, 1.0)
-        target_velocity = fluid * flow_response[:, None]
+        solid_fraction, granular_velocity = self._local_solid_effects(pos, diameter)
+        settling = self._settling_velocity(density, diameter, shape, solid_fraction)
+        target_velocity = fluid.copy()
         radial = np.sqrt(pos[:, 0] ** 2 + pos[:, 2] ** 2)
         radial_x = np.divide(pos[:, 0], np.maximum(radial, 1e-6))
         radial_z = np.divide(pos[:, 2], np.maximum(radial, 1e-6))
         tangential_speed = np.abs(
             fluid[:, 0] * (-radial_z) + fluid[:, 2] * radial_x
         )
-        inertia = np.clip(
-            ((density - WATER_DENSITY_KG_M3) / WATER_DENSITY_KG_M3) ** 1.6
-            * (diameter / 200e-6) ** 0.5,
-            0.0,
-            18.0,
+        tangential_reynolds = (
+            WATER_DENSITY_KG_M3
+            * tangential_speed
+            * np.maximum(diameter, 1e-9)
+            / WATER_VISCOSITY_PA_S
         )
+        drag_correction = 1.0 + 0.15 * np.maximum(tangential_reynolds, 1e-9) ** 0.687
+        response_time = density * np.maximum(diameter, 1e-9) ** 2 / (
+            18.0 * WATER_VISCOSITY_PA_S * drag_correction
+        )
+        centrifugal_acceleration = tangential_speed**2 / np.maximum(radial, 0.01 * self.geometry.cylinder_radius_m)
+        density_factor = np.maximum(0.0, density - WATER_DENSITY_KG_M3) / np.maximum(density, 1.0)
         centrifugal_slip = np.clip(
-            0.0038 * inertia * (tangential_speed / 0.12) ** 2,
+            response_time * centrifugal_acceleration * density_factor,
             0.0,
-            0.055,
+            0.5 * tangential_speed,
         )
         target_velocity[:, 0] += centrifugal_slip * radial_x
         target_velocity[:, 2] += centrifugal_slip * radial_z
         target_velocity[:, 1] -= settling
+        target_velocity += granular_velocity
 
-        alpha = min(1.0, self.config.dt_s / max(1e-4, self.config.velocity_relaxation_s))
+        alpha = self._drag_alpha_schiller_naumann(vel, target_velocity, density, diameter)
         noise = self.rng.normal(0.0, self.geometry.turbulence, size=vel.shape).astype(np.float32)
         noise[:, 0] += self.rng.normal(0.0, self.geometry.turbulence * 4.0, size=vel.shape[0])
-        vel += (target_velocity - vel) * alpha + noise * np.sqrt(self.config.dt_s)
+        vel += (target_velocity - vel) * alpha[:, None] + noise * np.sqrt(self.config.dt_s)
         pos += vel * self.config.dt_s
 
         self._update_overflow_tube_membership(active_indices, previous_pos, pos)
@@ -239,10 +244,88 @@ class ClassifierSimulation:
         density: np.ndarray,
         diameter: np.ndarray,
         shape: np.ndarray,
+        solid_fraction: np.ndarray,
     ) -> np.ndarray:
         density_delta = np.maximum(0.0, density - WATER_DENSITY_KG_M3)
-        stokes = density_delta * GRAVITY_M_S2 * diameter**2 / (18.0 * WATER_VISCOSITY_PA_S)
-        return stokes * np.clip(shape, 0.15, 1.5) * self.config.settling_scale
+        v_stokes = density_delta * GRAVITY_M_S2 * diameter**2 / (18.0 * WATER_VISCOSITY_PA_S)
+        reynolds = WATER_DENSITY_KG_M3 * v_stokes * np.maximum(diameter, 1e-9) / WATER_VISCOSITY_PA_S
+        drag_correction = 1.0 + 0.15 * np.maximum(reynolds, 1e-9) ** 0.687
+        v_terminal = v_stokes / drag_correction
+        hindered = np.clip(1.0 - solid_fraction, 0.05, 1.0) ** 4.65
+        return v_terminal * np.clip(shape, 0.15, 1.5) * hindered
+
+    def _drag_alpha_schiller_naumann(
+        self,
+        particle_velocity: np.ndarray,
+        target_velocity: np.ndarray,
+        density: np.ndarray,
+        diameter: np.ndarray,
+    ) -> np.ndarray:
+        relative_speed = np.linalg.norm(target_velocity - particle_velocity, axis=1)
+        reynolds = (
+            WATER_DENSITY_KG_M3
+            * relative_speed
+            * np.maximum(diameter, 1e-9)
+            / WATER_VISCOSITY_PA_S
+        )
+        correction = np.where(
+            reynolds < 1000.0,
+            1.0 + 0.15 * np.maximum(reynolds, 1e-9) ** 0.687,
+            0.0183333333 * np.maximum(reynolds, 1e-9),
+        )
+        response_time = density * np.maximum(diameter, 1e-9) ** 2 / (
+            18.0 * WATER_VISCOSITY_PA_S * correction
+        )
+        return np.clip(self.config.dt_s / np.maximum(response_time, 1e-5), 0.0, 1.0)
+
+    def _local_solid_effects(
+        self,
+        pos: np.ndarray,
+        diameter: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self.config.use_hindrance or pos.size == 0:
+            return np.zeros(pos.shape[0], dtype=np.float32), np.zeros_like(pos)
+
+        grid_n = 20
+        g = self.geometry
+        domain_min = np.array([-g.half_width_m, 0.0, -g.half_depth_m], dtype=np.float32)
+        domain_size = np.array([g.width_m, g.height_m, g.depth_m], dtype=np.float32)
+        normalized = np.clip((pos - domain_min) / np.maximum(domain_size, 1e-6), 0.0, 0.999999)
+        cells = (normalized * grid_n).astype(np.int32)
+        cells = np.clip(cells, 0, grid_n - 1)
+
+        grid = np.zeros((grid_n, grid_n, grid_n), dtype=np.float32)
+        particle_volume = (np.pi / 6.0) * np.maximum(diameter, 1e-9) ** 3
+        cell_volume = float(np.prod(domain_size / grid_n))
+        domain_volume = float(np.prod(domain_size))
+        target_solid_volume = self.config.feed_solid_volume_fraction * domain_volume
+        simulated_solid_volume = float(particle_volume.sum())
+        parcel_scale = float(np.clip(target_solid_volume / max(simulated_solid_volume, 1e-12), 1.0, 1e6))
+        np.add.at(grid, (cells[:, 0], cells[:, 1], cells[:, 2]), particle_volume * parcel_scale)
+
+        solid_fraction_grid = np.clip(grid / max(cell_volume, 1e-12), 0.0, 0.62)
+        solid_fraction = solid_fraction_grid[cells[:, 0], cells[:, 1], cells[:, 2]]
+
+        spacing = domain_size / grid_n
+        grad_x, grad_y, grad_z = np.gradient(
+            solid_fraction_grid,
+            float(spacing[0]),
+            float(spacing[1]),
+            float(spacing[2]),
+            edge_order=1,
+        )
+        gradient = np.column_stack(
+            (
+                grad_x[cells[:, 0], cells[:, 1], cells[:, 2]],
+                grad_y[cells[:, 0], cells[:, 1], cells[:, 2]],
+                grad_z[cells[:, 0], cells[:, 1], cells[:, 2]],
+            )
+        ).astype(np.float32)
+        gradient_norm = np.linalg.norm(gradient, axis=1)
+        overload = np.clip((solid_fraction - 0.45) / 0.17, 0.0, 1.0)
+        granular_velocity = -gradient / np.maximum(gradient_norm[:, None], 1e-6)
+        granular_velocity *= (0.018 * overload)[:, None]
+        return solid_fraction.astype(np.float32), granular_velocity.astype(np.float32)
 
     def _fluid_velocity(self, pos: np.ndarray, swirl_bias: np.ndarray) -> np.ndarray:
         g = self.geometry
@@ -250,9 +333,6 @@ class ClassifierSimulation:
         y = pos[:, 1]
         z = pos[:, 2]
 
-        y_norm = np.clip(y / g.height_m, 0.0, 1.0)
-        inlet_zone = np.exp(-((y - g.inlet_height_m) ** 2) / 0.0025)
-        cone_zone = np.clip((g.trap_height_m * 1.8 - y) / max(1e-6, g.trap_height_m * 1.8), 0.0, 1.0)
         radial = np.sqrt(x**2 + z**2)
         safe_radial = np.maximum(radial, 1e-6)
         local_radius = _allowed_radius_for_y(y, g)
@@ -262,43 +342,79 @@ class ClassifierSimulation:
         radial_x = x / safe_radial
         radial_z = z / safe_radial
 
-        angular_speed = (
-            (0.13 + 0.12 * radius_norm)
-            * np.sin(np.pi * y_norm)
-            * g.deflector_strength
-            + 0.07 * inlet_zone
+        y_norm = np.clip(y / g.height_m, 0.0, 1.0)
+        inlet_height_norm = np.clip(g.inlet_height_m / g.height_m, 0.0, 1.0)
+        inlet_zone = np.exp(-((y - g.inlet_height_m) ** 2) / max(1e-6, (0.11 * g.height_m) ** 2))
+
+        forced_vortex_radius = max(0.4 * g.overflow_tube_radius_m, 0.5e-3)
+        circulation_inlet_radius = max(0.6 * g.body_top_radius_m, g.overflow_tube_radius_m * 2.0)
+        circulation = (
+            2.0
+            * np.pi
+            * circulation_inlet_radius
+            * g.inlet_velocity_m_s
+            * np.clip(g.deflector_strength, 0.05, 1.5)
         )
-        tube_mouth_center = g.overflow_tube_bottom_height_m - 0.06 * g.height_m
-        tube_mouth_zone = np.exp(
-            -((y - tube_mouth_center) ** 2)
-            / max(1e-6, (0.16 * g.height_m) ** 2)
-        )
-        axial_reversal_zone = 0.35 + 0.65 * np.clip(
-            (y - 0.35 * g.trap_height_m)
-            / max(1e-6, g.overflow_tube_bottom_height_m - 0.35 * g.trap_height_m),
+        forced_vortex = circulation * safe_radial / (2.0 * np.pi * forced_vortex_radius ** 2)
+        free_vortex = circulation / (2.0 * np.pi * safe_radial)
+        tangential_speed = np.where(radial <= forced_vortex_radius, forced_vortex, free_vortex)
+        height_envelope = np.clip(
+            np.minimum(y_norm / max(0.05, inlet_height_norm * 0.6), 1.0)
+            * np.clip((1.0 - y_norm) / max(0.05, 1.0 - inlet_height_norm), 0.0, 1.0)
+            + 0.15,
             0.0,
             1.0,
         )
-        air_core = np.exp(
-            -((radial / max(1e-6, 1.25 * g.overflow_tube_radius_m)) ** 4)
+        tangential_speed *= height_envelope
+        tangential_speed += 0.45 * g.inlet_velocity_m_s * inlet_zone
+
+        # Continuous radial split between central upflow and annular downflow,
+        # with a smooth transition that respects volumetric continuity through
+        # the cyclone cross-section.
+        upflow_envelope_radius = np.maximum(0.40 * local_radius, 2.0 * g.overflow_tube_radius_m)
+        upflow_norm = radial / np.maximum(upflow_envelope_radius, 1e-6)
+        upflow_weight = np.exp(-(upflow_norm**3))
+        # Volumetric balance: downflow * annulus_area = upflow * core_area.
+        body_area = np.pi * max(g.body_top_radius_m, 1e-6) ** 2
+        tube_area = np.pi * max(g.overflow_tube_radius_m, 1e-6) ** 2
+        annulus_area = max(body_area - tube_area, 1e-6)
+        downflow_speed = g.upward_velocity_m_s * tube_area / annulus_area
+        reversal_zone = np.clip(
+            (y - 0.25 * g.trap_height_m)
+            / max(1e-6, g.overflow_tube_bottom_height_m - 0.25 * g.trap_height_m),
+            0.0,
+            1.0,
         )
-        vortex_finder_capture = np.exp(
-            -((radial / max(1e-6, 1.80 * g.overflow_tube_radius_m)) ** 4)
+        inner_upflow = g.upward_velocity_m_s * upflow_weight * reversal_zone
+        outer_downflow = -downflow_speed * (1.0 - upflow_weight)
+        mouth_zone = np.exp(
+            -((y - g.overflow_tube_bottom_height_m) ** 2)
+            / max(1e-6, (0.10 * g.height_m) ** 2)
         )
-        radial_pressure_feed = np.exp(
-            -((radial / max(1e-6, 2.60 * g.overflow_tube_radius_m)) ** 4)
+        short_circuit = (
+            0.40
+            * g.upward_velocity_m_s
+            * mouth_zone
+            * upflow_weight
         )
-        tube_suction = 3.0 * g.upward_velocity_m_s * tube_mouth_zone * vortex_finder_capture
-        inward_speed = 0.002 + 0.020 * cone_zone + 0.045 * tube_mouth_zone * radial_pressure_feed
-        stream_spread = 0.025 * swirl_bias * np.sin(np.pi * y_norm)
-        outer_circulation = min(g.upward_velocity_m_s, 0.045)
-        outer_downflow = -outer_circulation * (0.55 + 1.35 * radius_norm) * (1.0 - 0.96 * air_core)
-        inner_upflow = 7.50 * g.upward_velocity_m_s * air_core * axial_reversal_zone
+        axial_velocity = outer_downflow + inner_upflow + short_circuit
+
+        # Continuity-driven radial inflow toward the central upflow region.
+        area_ratio = np.clip((local_radius / np.maximum(g.body_top_radius_m, 1e-6)) ** 2, 0.20, 1.6)
+        continuity_draw = g.upward_velocity_m_s / np.maximum(area_ratio, 0.2)
+        inward_speed = (
+            0.30 * continuity_draw * (0.25 + 0.75 * radius_norm)
+            + 0.10
+            * g.inlet_velocity_m_s
+            * mouth_zone
+            * np.exp(-((radial / np.maximum(1e-6, 2.2 * upflow_envelope_radius)) ** 4))
+        )
+        stream_spread = 0.010 * swirl_bias * inlet_zone
 
         fluid = np.zeros_like(pos)
-        fluid[:, 0] = angular_speed * tangent_x - inward_speed * radial_x + stream_spread
-        fluid[:, 1] = outer_downflow + inner_upflow + tube_suction
-        fluid[:, 2] = angular_speed * tangent_z - inward_speed * radial_z
+        fluid[:, 0] = tangential_speed * tangent_x - inward_speed * radial_x + stream_spread
+        fluid[:, 1] = axial_velocity
+        fluid[:, 2] = tangential_speed * tangent_z - inward_speed * radial_z
         return fluid
 
     def _collide_with_walls(self, pos: np.ndarray, vel: np.ndarray, active_indices: np.ndarray) -> None:
@@ -339,12 +455,17 @@ class ClassifierSimulation:
     ) -> None:
         g = self.geometry
         radial = np.sqrt(pos[:, 0] ** 2 + pos[:, 2] ** 2)
-        crossed_mouth = (
+        capture_radius = 1.25 * g.overflow_tube_radius_m
+        entered_capture_stream = (
             (previous_pos[:, 1] < g.overflow_tube_bottom_height_m)
             & (pos[:, 1] >= g.overflow_tube_bottom_height_m)
-            & (radial <= g.overflow_tube_radius_m)
+            & (radial <= capture_radius)
         )
-        self._inside_overflow_tube[active_indices[crossed_mouth]] = True
+        inside_capture_stream = (
+            (pos[:, 1] >= g.overflow_tube_bottom_height_m)
+            & (radial <= capture_radius)
+        )
+        self._inside_overflow_tube[active_indices[entered_capture_stream | inside_capture_stream]] = True
 
     def _collide_with_overflow_tube(
         self,
@@ -412,13 +533,7 @@ class ClassifierSimulation:
 
         inside_tube = self._inside_overflow_tube[active_indices]
         if np.any(inside_tube):
-            tube_indices = active_indices[inside_tube]
-            density = self._density_kg_m3[tube_indices]
-            diameter = self._diameter_m[tube_indices]
-            density_response = (WATER_DENSITY_KG_M3 / np.maximum(density, 1.0)) ** 0.50
-            size_response = (150e-6 / np.maximum(diameter, 1e-9)) ** 0.35
-            tube_response = np.clip(1.2 * density_response * size_response, 0.10, 1.0)
-            tube_upflow = 4.0 * g.upward_velocity_m_s * tube_response
+            tube_upflow = 1.5 * g.upward_velocity_m_s
             vel[inside_tube, 1] = np.maximum(vel[inside_tube, 1], tube_upflow)
 
     def _collide_with_cylinder(self, pos: np.ndarray, vel: np.ndarray) -> None:
