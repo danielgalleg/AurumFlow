@@ -87,7 +87,98 @@ class ClassifierSimulation:
         self._released_count = 0
         self.step_index = 0
 
+        self._init_fluid_grid()
+
         self.reset()
+
+    def _init_fluid_grid(self) -> None:
+        g = self.geometry
+        self._grid_r_size = 256
+        self._grid_y_size = 256
+        self._max_r = g.width_m / 2.0
+        self._max_y = g.height_m
+
+        r = np.linspace(0.0, self._max_r, self._grid_r_size, dtype=np.float32)
+        y = np.linspace(0.0, self._max_y, self._grid_y_size, dtype=np.float32)
+        RR, YY = np.meshgrid(r, y, indexing='ij')
+        radial = RR.flatten()
+        y_flat = YY.flatten()
+        
+        safe_radial = np.maximum(radial, 1e-6)
+        local_radius = _allowed_radius_for_y(y_flat, g)
+        
+        y_norm = np.clip(y_flat / g.height_m, 0.0, 1.0)
+        inlet_height_norm = np.clip(g.inlet_height_m / g.height_m, 0.0, 1.0)
+        self._inlet_zone_grid = np.exp(-((y_flat - g.inlet_height_m) ** 2) / max(1e-6, (0.11 * g.height_m) ** 2)).reshape(self._grid_r_size, self._grid_y_size)
+
+        viscous_core_radius = max(g.overflow_tube_radius_m, 1e-3)
+        circulation_inlet_radius = max(0.6 * g.body_top_radius_m, g.overflow_tube_radius_m * 2.0)
+        circulation = (
+            2.0
+            * np.pi
+            * circulation_inlet_radius
+            * g.inlet_velocity_m_s
+            * np.clip(g.deflector_strength, 0.05, 1.5)
+        )
+        free_vortex = circulation / (2.0 * np.pi * safe_radial)
+        viscous_factor = 1.0 - np.exp(-((safe_radial / viscous_core_radius) ** 2))
+        tangential_speed = free_vortex * viscous_factor
+        tangential_speed = np.minimum(tangential_speed, 1.2 * g.inlet_velocity_m_s)
+        height_envelope = np.clip(
+            np.minimum(y_norm / max(0.05, inlet_height_norm * 0.6), 1.0)
+            * np.clip((1.0 - y_norm) / max(0.05, 1.0 - inlet_height_norm), 0.0, 1.0)
+            + 0.15,
+            0.0,
+            1.0,
+        )
+        tangential_speed *= height_envelope
+        tangential_speed += 0.45 * g.inlet_velocity_m_s * self._inlet_zone_grid.flatten()
+
+        envelope_floor = g.overflow_tube_radius_m
+        envelope_ceiling = 2.0 * g.overflow_tube_radius_m
+        upflow_envelope_radius = np.clip(0.5 * local_radius, envelope_floor, envelope_ceiling)
+        upflow_norm = radial / np.maximum(upflow_envelope_radius, 1e-6)
+        upflow_weight = np.exp(-(upflow_norm**4))
+        body_area = np.pi * max(g.body_top_radius_m, 1e-6) ** 2
+        mean_envelope = max(envelope_floor, 0.5 * (envelope_floor + envelope_ceiling))
+        core_integral_area = np.pi * mean_envelope ** 2
+        annulus_area = max(body_area - core_integral_area, 1e-6)
+        inlet_flow_rate = g.inlet_velocity_m_s * 0.05 * body_area
+        downflow_speed = 2.5 * inlet_flow_rate / annulus_area
+        reversal_zone = np.clip(
+            0.18
+            + 0.82
+            * (y_flat - 0.25 * g.trap_height_m)
+            / max(1e-6, g.overflow_tube_bottom_height_m - 0.25 * g.trap_height_m),
+            0.0,
+            1.0,
+        )
+        above_mouth = (y_flat >= g.overflow_tube_bottom_height_m).astype(np.float32)
+        inside_bore_axial = (radial <= g.overflow_tube_radius_m).astype(np.float32)
+        core_active = (1.0 - above_mouth) + above_mouth * inside_bore_axial
+        inner_upflow = g.upward_velocity_m_s * upflow_weight * reversal_zone * core_active
+        downflow_profile = (1.0 - above_mouth) * (1.0 - upflow_weight) + above_mouth * (1.0 - inside_bore_axial)
+        outer_downflow = -downflow_speed * downflow_profile
+        axial_velocity = outer_downflow + inner_upflow
+
+        active_height = max(g.overflow_tube_bottom_height_m - 0.25 * g.trap_height_m, 1e-3)
+        inflow_speed_at_radius = inlet_flow_rate / (2.0 * np.pi * np.maximum(radial, 1e-3) * active_height)
+        below_mouth = y_flat < g.overflow_tube_bottom_height_m
+        mouth_below = np.exp(
+            -((y_flat - g.overflow_tube_bottom_height_m) ** 2)
+            / max(1e-6, (0.10 * g.height_m) ** 2)
+        )
+        mouth_zone = np.where(below_mouth, mouth_below, 1.0)
+        outside_tube_bore = radial >= g.overflow_tube_radius_m
+        capture_kernel = np.exp(
+            -((radial / max(1e-6, 0.55 * g.body_top_radius_m)) ** 2)
+        ) * outside_tube_bore.astype(np.float32)
+        mouth_boost = 0.6 * g.inlet_velocity_m_s * mouth_zone * capture_kernel
+        inward_speed = inflow_speed_at_radius * (1.0 - upflow_weight) + mouth_boost
+
+        self._grid_v_tangential = tangential_speed.reshape(self._grid_r_size, self._grid_y_size)
+        self._grid_v_axial = axial_velocity.reshape(self._grid_r_size, self._grid_y_size)
+        self._grid_v_inward = inward_speed.reshape(self._grid_r_size, self._grid_y_size)
 
     def reset(self) -> None:
         fractions = normalize_fractions(self.materials)
@@ -347,129 +438,58 @@ class ClassifierSimulation:
         return solid_fraction.astype(np.float32), granular_velocity.astype(np.float32)
 
     def _fluid_velocity(self, pos: np.ndarray, swirl_bias: np.ndarray) -> np.ndarray:
-        g = self.geometry
         x = pos[:, 0]
         y = pos[:, 1]
         z = pos[:, 2]
 
         radial = np.sqrt(x**2 + z**2)
         safe_radial = np.maximum(radial, 1e-6)
-        local_radius = _allowed_radius_for_y(y, g)
-        radius_norm = np.clip(radial / np.maximum(1e-6, local_radius), 0.0, 1.0)
         tangent_x = -z / safe_radial
         tangent_z = x / safe_radial
         radial_x = x / safe_radial
         radial_z = z / safe_radial
 
-        y_norm = np.clip(y / g.height_m, 0.0, 1.0)
-        inlet_height_norm = np.clip(g.inlet_height_m / g.height_m, 0.0, 1.0)
-        inlet_zone = np.exp(-((y - g.inlet_height_m) ** 2) / max(1e-6, (0.11 * g.height_m) ** 2))
+        r_idx = np.clip(radial / self._max_r * (self._grid_r_size - 1), 0.0, self._grid_r_size - 1.001)
+        y_idx = np.clip(y / self._max_y * (self._grid_y_size - 1), 0.0, self._grid_y_size - 1.001)
 
-        # Burgers-Rott vortex: v_theta = Gamma/(2 pi r) * (1 - exp(-(r/r_core)^2))
-        # The viscous core merges with the vortex finder bore so the tangential
-        # velocity stays bounded at the axis instead of diverging like a pure
-        # free vortex would.
-        viscous_core_radius = max(g.overflow_tube_radius_m, 1e-3)
-        circulation_inlet_radius = max(0.6 * g.body_top_radius_m, g.overflow_tube_radius_m * 2.0)
-        circulation = (
-            2.0
-            * np.pi
-            * circulation_inlet_radius
-            * g.inlet_velocity_m_s
-            * np.clip(g.deflector_strength, 0.05, 1.5)
-        )
-        free_vortex = circulation / (2.0 * np.pi * safe_radial)
-        viscous_factor = 1.0 - np.exp(-((safe_radial / viscous_core_radius) ** 2))
-        tangential_speed = free_vortex * viscous_factor
-        # Cap the tangential speed: in real cyclones turbulent dissipation
-        # keeps the swirl from reaching the inviscid free-vortex limit close
-        # to the axis. ~1.2x inlet velocity matches typical LDV measurements.
-        tangential_speed = np.minimum(tangential_speed, 1.2 * g.inlet_velocity_m_s)
-        height_envelope = np.clip(
-            np.minimum(y_norm / max(0.05, inlet_height_norm * 0.6), 1.0)
-            * np.clip((1.0 - y_norm) / max(0.05, 1.0 - inlet_height_norm), 0.0, 1.0)
-            + 0.15,
-            0.0,
-            1.0,
-        )
-        tangential_speed *= height_envelope
-        tangential_speed += 0.45 * g.inlet_velocity_m_s * inlet_zone
+        r0 = r_idx.astype(np.int32)
+        r1 = r0 + 1
+        dr = r_idx - r0
 
-        # The central upflow sits inside the vortex finder core. The envelope
-        # is wider in the body (so feeds reaching r ~ tube_radius are still in
-        # the upflow zone) and contracts towards the trap apex, mimicking the
-        # acceleration of the air-core through a real cyclone cone.
-        envelope_floor = g.overflow_tube_radius_m
-        envelope_ceiling = 2.0 * g.overflow_tube_radius_m
-        upflow_envelope_radius = np.clip(0.5 * local_radius, envelope_floor, envelope_ceiling)
-        upflow_norm = radial / np.maximum(upflow_envelope_radius, 1e-6)
-        # A super-Gaussian profile (n=4) keeps the central core well-defined
-        # while quickly transitioning into the descending annulus, eliminating
-        # the wide "saddle" radius where upflow and downflow used to cancel.
-        upflow_weight = np.exp(-(upflow_norm**4))
-        body_area = np.pi * max(g.body_top_radius_m, 1e-6) ** 2
-        mean_envelope = max(envelope_floor, 0.5 * (envelope_floor + envelope_ceiling))
-        core_integral_area = np.pi * mean_envelope ** 2
-        annulus_area = max(body_area - core_integral_area, 1e-6)
-        inlet_flow_rate = g.inlet_velocity_m_s * 0.05 * body_area
-        # The primary downflow is usually stronger than the net volumetric feed
-        # because of internal recirculation. We boost it to ensure heavy particles
-        # are flushed down efficiently.
-        downflow_speed = 2.5 * inlet_flow_rate / annulus_area
-        # Vertical activation of the core upflow.
-        reversal_zone = np.clip(
-            0.18
-            + 0.82
-            * (y - 0.25 * g.trap_height_m)
-            / max(1e-6, g.overflow_tube_bottom_height_m - 0.25 * g.trap_height_m),
-            0.0,
-            1.0,
-        )
-        # Above the mouth, upflow is confined strictly to the tube bore.
-        # Below the mouth, the upflow core exists. To prevent particles from
-        # getting permanently trapped in a bounce ring exactly at the mouth plane
-        # (where upflow abruptly vanishes outside the bore), we allow a very
-        # small residual upflow outside the tube that quickly decays, while
-        # the strong outer_downflow dominates.
-        above_mouth = (y >= g.overflow_tube_bottom_height_m).astype(np.float32)
-        inside_bore_axial = (radial <= g.overflow_tube_radius_m).astype(np.float32)
-        core_active = (1.0 - above_mouth) + above_mouth * inside_bore_axial
-        # Downflow occupies the annulus. It is active everywhere except inside
-        # the ascending core below the mouth, and inside the tube bore above it.
-        # Above the mouth, the entire annulus outside the tube bore is pure
-        # downflow (unaffected by the upflow_weight which is only meant to
-        # split the flows below the mouth).
-        inner_upflow = g.upward_velocity_m_s * upflow_weight * reversal_zone * core_active
-        downflow_profile = (1.0 - above_mouth) * (1.0 - upflow_weight) + above_mouth * (1.0 - inside_bore_axial)
-        outer_downflow = -downflow_speed * downflow_profile
-        axial_velocity = outer_downflow + inner_upflow
+        y0 = y_idx.astype(np.int32)
+        y1 = y0 + 1
+        dy = y_idx - y0
 
-        # Radial inflow toward the core: dominated by the volumetric flow that
-        # must traverse a cylinder of radius r at every height to feed the core
-        # upflow. v_r ~ Q_in / (2 pi r dz_active).
-        active_height = max(g.overflow_tube_bottom_height_m - 0.25 * g.trap_height_m, 1e-3)
-        inflow_speed_at_radius = inlet_flow_rate / (2.0 * np.pi * np.maximum(radial, 1e-3) * active_height)
-        # The vortex finder mouth establishes a low-pressure core that pulls
-        # fluid radially inward across the annular space above and below the
-        # mouth height. Below the mouth it decays smoothly so sedimentation
-        # can still occur; above the mouth the suction stays active because
-        # the entire fluid feeding the tube has to converge to the bore.
-        below_mouth = y < g.overflow_tube_bottom_height_m
-        mouth_below = np.exp(
-            -((y - g.overflow_tube_bottom_height_m) ** 2)
-            / max(1e-6, (0.10 * g.height_m) ** 2)
+        w00 = (1.0 - dr) * (1.0 - dy)
+        w10 = dr * (1.0 - dy)
+        w01 = (1.0 - dr) * dy
+        w11 = dr * dy
+
+        tangential_speed = (
+            self._grid_v_tangential[r0, y0] * w00
+            + self._grid_v_tangential[r1, y0] * w10
+            + self._grid_v_tangential[r0, y1] * w01
+            + self._grid_v_tangential[r1, y1] * w11
         )
-        mouth_zone = np.where(below_mouth, mouth_below, 1.0)
-        # Capture kernel reaches well into the body so particles in the
-        # downcomer annulus are diverted toward the core rather than being
-        # lost to the trap. The kernel vanishes inside the tube bore so the
-        # suction never pushes particles through the tube wall.
-        outside_tube_bore = radial >= g.overflow_tube_radius_m
-        capture_kernel = np.exp(
-            -((radial / max(1e-6, 0.55 * g.body_top_radius_m)) ** 2)
-        ) * outside_tube_bore.astype(np.float32)
-        mouth_boost = 0.6 * g.inlet_velocity_m_s * mouth_zone * capture_kernel
-        inward_speed = inflow_speed_at_radius * (1.0 - upflow_weight) + mouth_boost
+        axial_velocity = (
+            self._grid_v_axial[r0, y0] * w00
+            + self._grid_v_axial[r1, y0] * w10
+            + self._grid_v_axial[r0, y1] * w01
+            + self._grid_v_axial[r1, y1] * w11
+        )
+        inward_speed = (
+            self._grid_v_inward[r0, y0] * w00
+            + self._grid_v_inward[r1, y0] * w10
+            + self._grid_v_inward[r0, y1] * w01
+            + self._grid_v_inward[r1, y1] * w11
+        )
+        inlet_zone = (
+            self._inlet_zone_grid[r0, y0] * w00
+            + self._inlet_zone_grid[r1, y0] * w10
+            + self._inlet_zone_grid[r0, y1] * w01
+            + self._inlet_zone_grid[r1, y1] * w11
+        )
+
         stream_spread = 0.010 * swirl_bias * inlet_zone
 
         fluid = np.zeros_like(pos)
