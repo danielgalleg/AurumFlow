@@ -28,27 +28,35 @@ ACTION_NAMES = (
     "trap_curve",
     "trap_floor_curve",
     "overflow_tube_radius_ratio",
+    "overflow_tube_bottom_radius_ratio",
+    "overflow_tube_curve",
     "overflow_tube_bottom_height_ratio",
     "inlet_height_ratio",
+    "inlet_pitch_deg",
+    "inlet_angle_deg",
     "flow_velocity_m_s",
 )
 
 ACTION_BOUNDS = {
-    "height_m": (0.26, 0.50),
-    "cyclone_top_radius_m": (0.045, 0.085),
+    "height_m": (0.15, 0.25),
+    "cyclone_top_radius_m": (0.02, 0.075),
     "body_wall_angle_deg": (45.0, 135.0),
     "body_curve": (-0.45, 0.45),
     "cone_curve": (-0.45, 0.45),
     "body_wall_length_ratio": (0.45, 0.72),
-    "cone_neck_radius_ratio": (0.14, 0.36),
+    "cone_neck_radius_ratio": (0.14, 1.0),
     "trap_wall_length_ratio": (0.08, 0.30),
     "trap_wall_angle_deg": (45.0, 135.0),
     "trap_curve": (-0.45, 0.45),
     "trap_floor_curve": (-0.45, 0.45),
-    "overflow_tube_radius_ratio": (0.06, 0.18),
+    "overflow_tube_radius_ratio": (0.06, 0.30),
+    "overflow_tube_bottom_radius_ratio": (0.06, 0.30),
+    "overflow_tube_curve": (-0.45, 0.45),
     "overflow_tube_bottom_height_ratio": (0.38, 0.70),
     "inlet_height_ratio": (0.58, 0.82),
-    "flow_velocity_m_s": (0.035, 0.12),
+    "inlet_pitch_deg": (-30.0, 30.0),
+    "inlet_angle_deg": (-120.0, -60.0),
+    "flow_velocity_m_s": (0.05, 0.50),
 }
 
 
@@ -121,6 +129,7 @@ def parameters_to_geometry(params: dict[str, float]) -> ClassifierGeometry:
     body_bottom_radius_ratio = body_bottom_radius / max(max_radius, 1e-6)
     cone_neck_radius_ratio = cone_neck_radius / max(max_radius, 1e-6)
     overflow_tube_radius_ratio = (top_radius * params["overflow_tube_radius_ratio"]) / max(max_radius, 1e-6)
+    overflow_tube_bottom_radius_ratio = (top_radius * params.get("overflow_tube_bottom_radius_ratio", params["overflow_tube_radius_ratio"])) / max(max_radius, 1e-6)
     trap_bottom_radius_ratio = trap_bottom_radius / max(cone_neck_radius, 1e-6)
     return ClassifierGeometry(
         width_m=2.0 * max_radius,
@@ -134,7 +143,9 @@ def parameters_to_geometry(params: dict[str, float]) -> ClassifierGeometry:
         body_top_radius_ratio=float(body_top_radius_ratio),
         body_bottom_radius_ratio=float(body_bottom_radius_ratio),
         overflow_tube_radius_ratio=float(overflow_tube_radius_ratio),
+        overflow_tube_bottom_radius_ratio=float(overflow_tube_bottom_radius_ratio),
         overflow_tube_bottom_height_ratio=params["overflow_tube_bottom_height_ratio"],
+        overflow_tube_curve=params.get("overflow_tube_curve", 0.0),
         cone_top_height_ratio=float(cone_top_height / height),
         cone_neck_radius_ratio=float(cone_neck_radius_ratio),
         trap_bottom_radius_ratio=float(trap_bottom_radius_ratio),
@@ -142,6 +153,8 @@ def parameters_to_geometry(params: dict[str, float]) -> ClassifierGeometry:
         cone_curve=params["cone_curve"],
         trap_curve=params["trap_curve"],
         trap_floor_curve=params["trap_floor_curve"],
+        inlet_pitch_deg=params.get("inlet_pitch_deg", 0.0),
+        inlet_angle_deg=params.get("inlet_angle_deg", -90.0),
     )
 
 

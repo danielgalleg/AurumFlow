@@ -96,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         help="none para barridos rapidos; pairCollision para validacion densa mas costosa.",
     )
     parser.add_argument(
+        "--cores",
+        type=int,
+        default=14,
+        help="Numero de nucleos para MPI de particulas.",
+    )
+    parser.add_argument(
         "--parcels-scale",
         type=float,
         default=1.0,
@@ -158,15 +164,19 @@ def selected_flow_time(base_case: Path, flow_time: str) -> Path:
 def inlet_velocity_vector(metadata: dict, scale: float) -> tuple[float, float, float]:
     velocity = float(metadata["geometry"]["inlet_velocity_m_s"]) * scale
     angle = math.radians(float(metadata["derived"].get("inlet_angle_deg", -90.0)))
+    pitch = math.radians(float(metadata["derived"].get("inlet_pitch_deg", 0.0)))
     inward = (-math.cos(angle), 0.0, -math.sin(angle))
     tangent = (-math.sin(angle), 0.0, math.cos(angle))
     swirl_weight = 0.75
     radial_weight = 0.65
-    return (
-        velocity * (radial_weight * inward[0] + swirl_weight * tangent[0]),
-        0.0,
-        velocity * (radial_weight * inward[2] + swirl_weight * tangent[2]),
-    )
+    
+    # Calculate horizontal components
+    vx = velocity * math.cos(pitch) * (radial_weight * inward[0] + swirl_weight * tangent[0])
+    vz = velocity * math.cos(pitch) * (radial_weight * inward[2] + swirl_weight * tangent[2])
+    # Calculate vertical component
+    vy = velocity * math.sin(pitch)
+    
+    return (vx, vy, vz)
 
 
 def generate_inlet_positions(
@@ -240,7 +250,16 @@ simulationType  laminar;
     )
 
 
-def write_system(case_dir: Path, end_time: float, delta_t: float, write_interval: float) -> None:
+def write_system(case_dir: Path, end_time: float, delta_t: float, write_interval: float, cores: int) -> None:
+    if cores > 1:
+        (case_dir / "system" / "decomposeParDict").write_text(
+            foam_header("dictionary", "decomposeParDict")
+            + f"""
+numberOfSubdomains {cores};
+method          scotch;
+""",
+            encoding="utf-8",
+        )
     (case_dir / "system" / "controlDict").write_text(
         foam_header("dictionary", "controlDict")
         + f"""
@@ -567,7 +586,7 @@ def create_case(
     velocity = inlet_velocity_vector(metadata, args.velocity_scale)
     write_g(case_dir)
     write_transport(case_dir)
-    write_system(case_dir, args.end_time, args.delta_t, args.write_interval)
+    write_system(case_dir, args.end_time, args.delta_t, args.write_interval, args.cores)
     write_cloud_properties(case_dir, run_material, velocity, patches, args.collision_model)
     write_manifest(case_dir, base_case, flow_time, run_material, metadata, positions, args.collision_model)
     write_allrun(case_dir)

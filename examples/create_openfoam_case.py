@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case-dir", required=True, help="Directorio del caso OpenFOAM a crear.")
     parser.add_argument("--base-cells", type=int, default=44, help="Resolucion base por eje horizontal.")
     parser.add_argument("--refinement-level", type=int, default=2, help="Nivel snappyHexMesh sobre el STL.")
+    parser.add_argument("--cores", type=int, default=14, help="Numero de nucleos para MPI.")
     return parser.parse_args()
 
 
@@ -44,16 +45,17 @@ def read_metadata(path: Path) -> dict:
 def inlet_velocity_vector(metadata: dict) -> tuple[float, float, float]:
     velocity = float(metadata["geometry"]["inlet_velocity_m_s"])
     angle = math.radians(float(metadata["derived"].get("inlet_angle_deg", -90.0)))
+    pitch = math.radians(float(metadata["derived"].get("inlet_pitch_deg", 0.0)))
     inward = (-math.cos(angle), 0.0, -math.sin(angle))
     tangent = (-math.sin(angle), 0.0, math.cos(angle))
     swirl_weight = 0.75
     radial_weight = 0.65
-    vector = (
-        velocity * (radial_weight * inward[0] + swirl_weight * tangent[0]),
-        0.0,
-        velocity * (radial_weight * inward[2] + swirl_weight * tangent[2]),
-    )
-    return vector
+    
+    vx = velocity * math.cos(pitch) * (radial_weight * inward[0] + swirl_weight * tangent[0])
+    vz = velocity * math.cos(pitch) * (radial_weight * inward[2] + swirl_weight * tangent[2])
+    vy = velocity * math.sin(pitch)
+    
+    return (vx, vy, vz)
 
 
 def patch_names(stl_prefix: str) -> dict[str, str]:
@@ -258,7 +260,16 @@ mergeTolerance 1e-6;
     (case_dir / "system" / "snappyHexMeshDict").write_text(text, encoding="utf-8")
 
 
-def write_case_controls(case_dir: Path) -> None:
+def write_case_controls(case_dir: Path, cores: int) -> None:
+    if cores > 1:
+        (case_dir / "system" / "decomposeParDict").write_text(
+            foam_header("dictionary", "decomposeParDict")
+            + f"""
+numberOfSubdomains {cores};
+method          scotch;
+""",
+            encoding="utf-8",
+        )
     (case_dir / "system" / "controlDict").write_text(
         foam_header("dictionary", "controlDict")
         + """
@@ -446,7 +457,13 @@ checkMesh
         """#!/usr/bin/env bash
 set -euo pipefail
 
-simpleFoam
+if [ -f system/decomposeParDict ]; then
+    decomposePar -force
+    mpirun --oversubscribe -np $(grep numberOfSubdomains system/decomposeParDict | tr -dc '0-9') simpleFoam -parallel
+    reconstructPar -latestTime
+else
+    simpleFoam
+fi
 """,
         encoding="utf-8",
     )
@@ -484,7 +501,7 @@ def main() -> None:
     write_block_mesh(case_dir, metadata, args.base_cells)
     write_surface_features(case_dir, args.stl_name)
     write_snappy(case_dir, metadata, args.stl_name, stl_prefix, args.refinement_level)
-    write_case_controls(case_dir)
+    write_case_controls(case_dir, args.cores)
     write_physical_properties(case_dir)
     write_initial_fields(case_dir, metadata, stl_prefix)
     write_allrun(case_dir)

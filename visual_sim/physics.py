@@ -123,7 +123,6 @@ class ClassifierSimulation:
         free_vortex = circulation / (2.0 * np.pi * safe_radial)
         viscous_factor = 1.0 - np.exp(-((safe_radial / viscous_core_radius) ** 2))
         tangential_speed = free_vortex * viscous_factor
-        tangential_speed = np.minimum(tangential_speed, 1.2 * g.inlet_velocity_m_s)
         height_envelope = np.clip(
             np.minimum(y_norm / max(0.05, inlet_height_norm * 0.6), 1.0)
             * np.clip((1.0 - y_norm) / max(0.05, 1.0 - inlet_height_norm), 0.0, 1.0)
@@ -144,6 +143,10 @@ class ClassifierSimulation:
         core_integral_area = np.pi * mean_envelope ** 2
         annulus_area = max(body_area - core_integral_area, 1e-6)
         inlet_flow_rate = g.inlet_velocity_m_s * 0.05 * body_area
+        
+        real_upward_velocity = inlet_flow_rate / (np.pi * max(g.overflow_tube_radius_m, 1e-6)**2)
+        self._real_upward_velocity = float(real_upward_velocity)
+        
         downflow_speed = 2.5 * inlet_flow_rate / annulus_area
         reversal_zone = np.clip(
             0.18
@@ -156,9 +159,15 @@ class ClassifierSimulation:
         above_mouth = (y_flat >= g.overflow_tube_bottom_height_m).astype(np.float32)
         inside_bore_axial = (radial <= g.overflow_tube_radius_m).astype(np.float32)
         core_active = (1.0 - above_mouth) + above_mouth * inside_bore_axial
-        inner_upflow = g.upward_velocity_m_s * upflow_weight * reversal_zone * core_active
+        inner_upflow = real_upward_velocity * upflow_weight * reversal_zone * core_active
         downflow_profile = (1.0 - above_mouth) * (1.0 - upflow_weight) + above_mouth * (1.0 - inside_bore_axial)
-        outer_downflow = -downflow_speed * downflow_profile
+        
+        # Efecto "Downcomer" (Corriente descendente de pared) descubierto en OpenFOAM
+        # El agua choca con la pared exterior, pierde velocidad tangencial y es forzada hacia abajo violentamente.
+        wall_proximity = np.clip((radial - 0.80 * local_radius) / np.maximum(0.20 * local_radius, 1e-6), 0.0, 1.0)
+        wall_downcomer = -1.5 * g.inlet_velocity_m_s * (wall_proximity ** 2)
+        
+        outer_downflow = -downflow_speed * downflow_profile + wall_downcomer
         axial_velocity = outer_downflow + inner_upflow
 
         active_height = max(g.overflow_tube_bottom_height_m - 0.25 * g.trap_height_m, 1e-3)
@@ -653,7 +662,7 @@ class ClassifierSimulation:
 
         inside_tube = self._inside_overflow_tube[active_indices]
         if np.any(inside_tube):
-            tube_upflow = 1.5 * g.upward_velocity_m_s
+            tube_upflow = 1.5 * getattr(self, "_real_upward_velocity", g.upward_velocity_m_s)
             vel[inside_tube, 1] = np.maximum(vel[inside_tube, 1], tube_upflow)
 
     def _collide_with_cylinder(self, pos: np.ndarray, vel: np.ndarray) -> None:

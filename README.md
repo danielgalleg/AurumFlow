@@ -12,13 +12,14 @@ Current capabilities:
 
 - A simple 0-D process simulator for rough mass-balance thinking.
 - A local 3D particle visualizer for rapid geometry exploration.
-- Reinforcement learning and genetic algorithm workflows for candidate geometry search.
+- **"Geometry 2.0"**: Advanced 3D parameterization including miniaturization (backpack-sized), 12V solar pump limits, independent overflow tube curvature (flared/tapered tips), and 3D inlet pitch/angle.
+- **OpenFOAM-Driven Genetic Algorithm**: Direct coupling of evolutionary optimization with OpenFOAM CFD evaluation using mass-based metrics (`train_geometry_ga_openfoam.py`).
 - STL/metadata export for OpenFOAM.
 - OpenFOAM case generation for internal water-flow validation.
 - Native OpenFOAM particle tracking by material class.
 - ParaView automation for screenshots, orbit videos, streamlines, and particle overlays.
 
-Important limitation: the local visual simulator is not a full CFD/DEM solver. It is useful for generating hypotheses, but final design decisions should be checked with OpenFOAM, higher-fidelity CFD+DEM, and physical bench tests.
+Important limitation: the local visual simulator is not a full CFD/DEM solver. It is useful for generating hypotheses, but final design decisions are now driven by OpenFOAM CFD validations.
 
 ## Repository Layout
 
@@ -90,7 +91,21 @@ Headless local simulation:
 python3 examples/run_classifier_3d.py --headless --frames 3000 --particles 5000
 ```
 
-Run a genetic optimization:
+Run a genetic optimization directly coupled with OpenFOAM (Recommended):
+
+```bash
+python3 examples/train_geometry_ga_openfoam.py \
+  --generations 40 \
+  --population 96 \
+  --base-cells 32 \
+  --particle-end-time 6.0 \
+  --parcels-scale 0.05 \
+  --cores-per-eval 2 \
+  --n-jobs 7 \
+  --output-dir rl_runs/ga_openfoam_med_res
+```
+
+Run a fast local genetic optimization (for quick testing, not physically accurate):
 
 ```bash
 python3 examples/train_geometry_ga.py \

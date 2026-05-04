@@ -241,7 +241,7 @@ def build_stl_triangles(
         outer_rings,
         y_values,
         inlet_height_m=geometry.inlet_height_m,
-        inlet_angle_deg=inlet_angle_deg,
+        inlet_angle_deg=geometry.inlet_angle_deg,
         inlet_angular_width_deg=inlet_angular_width_deg,
         inlet_patch_height_m=inlet_patch_height_m,
     )
@@ -251,13 +251,20 @@ def build_stl_triangles(
     top_inner = ring_points(geometry.overflow_tube_radius_m, geometry.height_m, angular_segments)
     add_ring_surface(groups["roof"], top_outer, top_inner)
 
-    # Overflow tube wall, represented as internal boundary from roof down to its mouth.
-    tube_bottom = ring_points(
-        geometry.overflow_tube_radius_m,
-        geometry.overflow_tube_bottom_height_m,
-        angular_segments,
-    )
-    add_ring_surface(groups["overflow_tube_wall"], top_inner, tube_bottom)
+    # Overflow tube wall (now curved and tapered)
+    tube_y_values = [
+        geometry.overflow_tube_bottom_height_m + (geometry.height_m - geometry.overflow_tube_bottom_height_m) * idx / max(1, axial_samples - 1)
+        for idx in range(max(2, axial_samples))
+    ]
+    tube_rings = [
+        ring_points(geometry.overflow_tube_radius_at_height(y_m), y_m, angular_segments)
+        for y_m in tube_y_values
+    ]
+    for lower, upper in zip(tube_rings, tube_rings[1:]):
+        add_ring_surface(groups["overflow_tube_wall"], upper, lower)  # Note: upper to lower for correct normal (pointing inwards to the fluid)
+    
+    tube_bottom = tube_rings[0]
+    
     add_disk(
         groups["overflow_mouth"],
         (0.0, geometry.overflow_tube_bottom_height_m, 0.0),
@@ -336,7 +343,8 @@ def metadata(
             "overflow_tube_radius_m": geometry.overflow_tube_radius_m,
             "overflow_tube_bottom_height_m": geometry.overflow_tube_bottom_height_m,
             "inlet_height_m": geometry.inlet_height_m,
-            "inlet_angle_deg": inlet_angle_deg,
+            "inlet_angle_deg": geometry.inlet_angle_deg,
+            "inlet_pitch_deg": geometry.inlet_pitch_deg,
             "inlet_angular_width_deg": inlet_angular_width_deg,
             "inlet_patch_height_m": inlet_patch_height_m,
             "profile_samples": profile_count,

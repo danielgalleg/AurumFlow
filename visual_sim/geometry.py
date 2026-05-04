@@ -20,7 +20,11 @@ class ClassifierGeometry:
     body_top_radius_ratio: float = 1.0
     body_bottom_radius_ratio: float = 0.76
     overflow_tube_radius_ratio: float = 0.10
+    overflow_tube_bottom_radius_ratio: float = 0.10
     overflow_tube_bottom_height_ratio: float = 0.50
+    overflow_tube_curve: float = 0.0
+    inlet_pitch_deg: float = 0.0
+    inlet_angle_deg: float = -90.0
     cone_top_height_ratio: float = 0.34
     cone_neck_radius_ratio: float = 0.24
     trap_bottom_radius_ratio: float = 0.55
@@ -64,6 +68,20 @@ class ClassifierGeometry:
     @property
     def overflow_tube_radius_m(self) -> float:
         return self.cylinder_radius_m * self.overflow_tube_radius_ratio
+
+    @property
+    def overflow_tube_bottom_radius_m(self) -> float:
+        return self.cylinder_radius_m * self.overflow_tube_bottom_radius_ratio
+
+    def overflow_tube_radius_at_height(self, height_m: float) -> float:
+        if height_m <= self.overflow_tube_bottom_height_m:
+            return self.overflow_tube_bottom_radius_m
+        t = (height_m - self.overflow_tube_bottom_height_m) / max(1e-6, self.height_m - self.overflow_tube_bottom_height_m)
+        t = max(0.0, min(1.0, t))
+        linear_radius = self.overflow_tube_bottom_radius_m + (self.overflow_tube_radius_m - self.overflow_tube_bottom_radius_m) * t
+        curve_scale = max(self.overflow_tube_radius_m, self.overflow_tube_bottom_radius_m)
+        curve_radius = self.overflow_tube_curve * curve_scale * 4.0 * t * (1.0 - t)
+        return max(1e-6, linear_radius + curve_radius)
 
     @property
     def overflow_tube_bottom_height_m(self) -> float:
@@ -134,14 +152,16 @@ class ClassifierGeometry:
             raise ValueError("body_top_radius_ratio debe estar entre 0.05 y 1.0")
         if not 0.005 <= self.body_bottom_radius_ratio <= 1.0:
             raise ValueError("body_bottom_radius_ratio debe estar entre 0.005 y 1.0")
-        if not 0.005 <= self.overflow_tube_radius_ratio <= 0.22:
-            raise ValueError("overflow_tube_radius_ratio debe estar entre 0.005 y 0.22")
+        if not 0.005 <= self.overflow_tube_radius_ratio <= 0.30:
+            raise ValueError("overflow_tube_radius_ratio debe estar entre 0.005 y 0.30")
+        if not 0.005 <= self.overflow_tube_bottom_radius_ratio <= 0.30:
+            raise ValueError("overflow_tube_bottom_radius_ratio debe estar entre 0.005 y 0.30")
         if not 0.30 <= self.overflow_tube_bottom_height_ratio <= 0.78:
             raise ValueError("overflow_tube_bottom_height_ratio debe estar entre 0.30 y 0.78")
         if not 0.22 <= self.cone_top_height_ratio <= 0.55:
             raise ValueError("cone_top_height_ratio debe estar entre 0.22 y 0.55")
-        if not 0.03 <= self.cone_neck_radius_ratio <= 0.60:
-            raise ValueError("cone_neck_radius_ratio debe estar entre 0.03 y 0.60")
+        if not 0.03 <= self.cone_neck_radius_ratio <= 1.0:
+            raise ValueError("cone_neck_radius_ratio debe estar entre 0.03 y 1.0")
         if not 0.05 <= self.trap_bottom_radius_ratio <= 8.00:
             raise ValueError("trap_bottom_radius_ratio debe estar entre 0.05 y 8.00")
         if not -0.45 <= self.body_curve <= 0.45:
@@ -152,6 +172,12 @@ class ClassifierGeometry:
             raise ValueError("trap_curve debe estar entre -0.45 y 0.45")
         if not -0.45 <= self.trap_floor_curve <= 0.45:
             raise ValueError("trap_floor_curve debe estar entre -0.45 y 0.45")
+        if not -0.45 <= self.overflow_tube_curve <= 0.45:
+            raise ValueError("overflow_tube_curve debe estar entre -0.45 y 0.45")
+        if not -45.0 <= self.inlet_pitch_deg <= 45.0:
+            raise ValueError("inlet_pitch_deg debe estar entre -45.0 y 45.0")
+        if not -135.0 <= self.inlet_angle_deg <= -45.0:
+            raise ValueError("inlet_angle_deg debe estar entre -135.0 y -45.0")
         if not self.trap_height_m < self.cone_top_height_m < self.inlet_height_m:
             raise ValueError("El cono debe quedar sobre la trampa y bajo la entrada")
         if self.cone_neck_half_depth_m >= self.cylinder_radius_m:

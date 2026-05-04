@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--name-prefix", default="candidate", help="Prefijo de candidatos.")
     parser.add_argument("--base-cells", type=int, default=24, help="Resolucion base baja para barrido rapido.")
     parser.add_argument("--refinement-level", type=int, default=1, help="Refinamiento snappyHexMesh.")
+    parser.add_argument("--cores", type=int, default=14, help="Numero de nucleos para MPI.")
     parser.add_argument("--axial-samples", type=int, default=96, help="Muestras axiales del STL.")
     parser.add_argument("--radial-samples", type=int, default=20, help="Muestras radiales del piso/trampa.")
     parser.add_argument("--angular-segments", type=int, default=56, help="Segmentos angulares del STL.")
@@ -45,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-particles", action="store_true", help="No crear/correr particulas.")
     parser.add_argument("--keep-existing", action="store_true", help="No borrar directorios de candidatos existentes.")
     parser.add_argument("--dry-run", action="store_true", help="Imprime comandos sin ejecutarlos.")
+    parser.add_argument("--timeout-flow", type=int, default=None, help="Timeout en segundos para el solver de fluidos.")
+    parser.add_argument("--timeout-particles", type=int, default=None, help="Timeout en segundos para el solver de particulas.")
     return parser.parse_args()
 
 
@@ -52,15 +55,15 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def run_command(command: list[str], cwd: Path, dry_run: bool = False) -> None:
+def run_command(command: list[str], cwd: Path, dry_run: bool = False, timeout: int | None = None) -> None:
     printable = " ".join(f'"{part}"' if " " in part else part for part in command)
     print(f"$ {printable}")
     if dry_run:
         return
-    subprocess.run(command, cwd=cwd, check=True)
+    subprocess.run(command, cwd=cwd, check=True, timeout=timeout)
 
 
-def docker_run(case_rel: Path, command: str, image: str, cwd: Path, dry_run: bool = False) -> None:
+def docker_run(case_rel: Path, command: str, image: str, cwd: Path, dry_run: bool = False, timeout: int | None = None) -> None:
     uid = os.getuid()
     gid = os.getgid()
     run_command(
@@ -79,6 +82,7 @@ def docker_run(case_rel: Path, command: str, image: str, cwd: Path, dry_run: boo
         ],
         cwd=cwd,
         dry_run=dry_run,
+        timeout=timeout,
     )
 
 
@@ -236,12 +240,14 @@ def run_candidate(
             str(args.base_cells),
             "--refinement-level",
             str(args.refinement_level),
+            "--cores",
+            str(args.cores),
         ],
         cwd=cwd,
         dry_run=args.dry_run,
     )
     if not args.skip_flow_run:
-        docker_run(path_for_docker(case_dir, cwd), "./Allclean && ./Allrun && ./AllrunFlow", args.docker_image, cwd, args.dry_run)
+        docker_run(path_for_docker(case_dir, cwd), "./Allclean && ./Allrun && ./AllrunFlow", args.docker_image, cwd, args.dry_run, timeout=args.timeout_flow)
 
     combined: dict[str, float] = {}
     metrics_json = particles_dir / "particle_metrics.json"
@@ -264,11 +270,13 @@ def run_candidate(
                 str(args.parcels_scale),
                 "--collision-model",
                 args.collision_model,
+                "--cores",
+                str(args.cores),
             ],
             cwd=cwd,
             dry_run=args.dry_run,
         )
-        docker_run(path_for_docker(particles_dir, cwd), "./AllrunParticles", args.docker_image, cwd, args.dry_run)
+        docker_run(path_for_docker(particles_dir, cwd), "./AllrunParticles", args.docker_image, cwd, args.dry_run, timeout=args.timeout_particles)
         run_command(
             [
                 sys.executable,
