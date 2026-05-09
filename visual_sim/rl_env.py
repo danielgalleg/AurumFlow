@@ -15,48 +15,47 @@ from .metrics import SimulationMetrics, compute_metrics
 from .physics import ClassifierSimulation, SimulationConfig
 
 
+# NOTA: inlet_angle_deg fue ELIMINADO del action space porque la geometria es
+# axisimetrica (de revolucion). Rotar el inlet alrededor del eje Y produce un
+# resultado fisico identico salvo por una rotacion rigida del campo, asi que
+# era un grado de libertad fantasma que solo le agregaba ruido al GA. El
+# ClassifierGeometry mantiene el campo con default -90.0 para no romper los
+# scripts que generan STL/OpenFOAM cases.
 ACTION_NAMES = (
     "height_m",
-    "cyclone_top_radius_m",
-    "body_wall_angle_deg",
-    "body_curve",
-    "cone_curve",
-    "body_wall_length_ratio",
-    "cone_neck_radius_ratio",
-    "trap_wall_length_ratio",
-    "trap_wall_angle_deg",
-    "trap_curve",
-    "trap_floor_curve",
-    "overflow_tube_radius_ratio",
-    "overflow_tube_bottom_radius_ratio",
-    "overflow_tube_curve",
-    "overflow_tube_bottom_height_ratio",
+    "neck_height_ratio",
+    "neck_radius_m",
+    "upper_max_radius_m",
+    "upper_max_position_ratio",
+    "lower_max_radius_m",
+    "lower_max_position_ratio",
     "inlet_height_ratio",
     "inlet_pitch_deg",
-    "inlet_angle_deg",
+    "inlet_yaw_deg",
+    "central_tube_radius_m",
+    "central_tube_bottom_ratio",
     "flow_velocity_m_s",
 )
 
 ACTION_BOUNDS = {
-    "height_m": (0.15, 0.25),
-    "cyclone_top_radius_m": (0.02, 0.075),
-    "body_wall_angle_deg": (45.0, 135.0),
-    "body_curve": (-0.45, 0.45),
-    "cone_curve": (-0.45, 0.45),
-    "body_wall_length_ratio": (0.45, 0.72),
-    "cone_neck_radius_ratio": (0.14, 1.0),
-    "trap_wall_length_ratio": (0.08, 0.30),
-    "trap_wall_angle_deg": (45.0, 135.0),
-    "trap_curve": (-0.45, 0.45),
-    "trap_floor_curve": (-0.45, 0.45),
-    "overflow_tube_radius_ratio": (0.06, 0.30),
-    "overflow_tube_bottom_radius_ratio": (0.06, 0.30),
-    "overflow_tube_curve": (-0.45, 0.45),
-    "overflow_tube_bottom_height_ratio": (0.38, 0.70),
-    "inlet_height_ratio": (0.58, 0.82),
-    "inlet_pitch_deg": (-30.0, 30.0),
-    "inlet_angle_deg": (-120.0, -60.0),
-    "flow_velocity_m_s": (0.05, 0.50),
+    "height_m": (0.10, 0.40),
+    "neck_height_ratio": (0.10, 0.90),
+    "neck_radius_m": (0.002, 0.050),
+    "upper_max_radius_m": (0.025, 0.120),
+    "upper_max_position_ratio": (0.10, 0.90),
+    "lower_max_radius_m": (0.025, 0.120),
+    "lower_max_position_ratio": (0.10, 0.90),
+    "inlet_height_ratio": (0.05, 0.95),
+    "inlet_pitch_deg": (-89.5, 89.5),
+    "inlet_yaw_deg": (0.0, 89.5),
+    # Tubo central minimo 3mm: tubos sub-3mm rompen el mesh (cell-size local
+    # demasiado fino) y no son manufacturables con tolerancia razonable.
+    "central_tube_radius_m": (0.003, 0.040),
+    "central_tube_bottom_ratio": (0.01, 0.99),
+    # Velocidades >2 m/s generan Reynolds turbulento que simpleFoam laminar
+    # no resuelve confiable; el campeon usa 0.34 m/s y el optimo tipico de
+    # elutriacion esta en 0.1-1.0 m/s. Limitar a 2.0 ahorra exploracion inutil.
+    "flow_velocity_m_s": (0.10, 2.00),
 }
 
 
@@ -81,80 +80,50 @@ def action_to_parameters(action: np.ndarray) -> dict[str, float]:
 
 
 def parameters_to_geometry(params: dict[str, float]) -> ClassifierGeometry:
-    height = params["height_m"]
-    top_radius = params["cyclone_top_radius_m"]
-    body_wall_length_ratio = params.get("body_wall_length_ratio", 1.0 - params.get("cone_top_height_ratio", 0.39))
-    trap_wall_length_ratio = params.get("trap_wall_length_ratio", params.get("trap_height_ratio", 0.185))
-    cone_top_height = (1.0 - body_wall_length_ratio) * height
-    min_cone_length = 0.07 * height
-    trap_height = min(trap_wall_length_ratio * height, cone_top_height - min_cone_length)
-    trap_height = max(0.035 * height, trap_height)
-    inlet_height = max(params["inlet_height_ratio"] * height, cone_top_height + 0.04 * height)
-    inlet_height = min(0.94 * height, inlet_height)
-    outlet_height = min(height, max(inlet_height + 0.03 * height, 0.88 * height))
-    flow_velocity = params["flow_velocity_m_s"]
-    body_drop = height - cone_top_height
-    min_body_bottom_radius = 0.005 * top_radius
-    body_slope = np.tan(np.deg2rad(90.0 - params["body_wall_angle_deg"]))
-    body_bottom_radius = max(min_body_bottom_radius, top_radius - body_slope * body_drop)
-    cone_neck_radius = top_radius * params["cone_neck_radius_ratio"]
-    trap_slope = np.tan(np.deg2rad(90.0 - params["trap_wall_angle_deg"]))
-    min_trap_bottom_radius = 0.05 * cone_neck_radius
-    trap_bottom_radius = max(min_trap_bottom_radius, cone_neck_radius - trap_slope * trap_height)
-    body_required_radius = max(top_radius, body_bottom_radius)
-    if params["body_curve"] > 0.0:
-        for t in np.linspace(0.0, 1.0, 17):
-            linear_radius = body_bottom_radius + (top_radius - body_bottom_radius) * float(t)
-            curve_fraction = params["body_curve"] * 4.0 * float(t) * (1.0 - float(t))
-            body_required_radius = max(body_required_radius, linear_radius / max(1e-6, 1.0 - curve_fraction))
-    cone_required_radius = max(cone_neck_radius, body_bottom_radius)
-    for t in np.linspace(0.0, 1.0, 17):
-        linear_radius = cone_neck_radius + (body_bottom_radius - cone_neck_radius) * float(t)
-        curve_radius = params["cone_curve"] * max(cone_neck_radius, body_bottom_radius) * 4.0 * float(t) * (
-            1.0 - float(t)
-        )
-        cone_required_radius = max(cone_required_radius, linear_radius + curve_radius)
-    trap_required_radius = max(cone_neck_radius, trap_bottom_radius)
-    for t in np.linspace(0.0, 1.0, 17):
-        linear_radius = trap_bottom_radius + (cone_neck_radius - trap_bottom_radius) * float(t)
-        curve_radius = params["trap_curve"] * cone_neck_radius * 4.0 * float(t) * (1.0 - float(t))
-        trap_required_radius = max(trap_required_radius, linear_radius + curve_radius)
-    max_radius = max(
-        top_radius,
-        body_required_radius,
-        cone_required_radius,
-        trap_required_radius,
-    )
-    body_top_radius_ratio = top_radius / max(max_radius, 1e-6)
-    body_bottom_radius_ratio = body_bottom_radius / max(max_radius, 1e-6)
-    cone_neck_radius_ratio = cone_neck_radius / max(max_radius, 1e-6)
-    overflow_tube_radius_ratio = (top_radius * params["overflow_tube_radius_ratio"]) / max(max_radius, 1e-6)
-    overflow_tube_bottom_radius_ratio = (top_radius * params.get("overflow_tube_bottom_radius_ratio", params["overflow_tube_radius_ratio"])) / max(max_radius, 1e-6)
-    trap_bottom_radius_ratio = trap_bottom_radius / max(cone_neck_radius, 1e-6)
+    """Convierte un dict de parametros normalizados (del GA) en una ClassifierGeometry
+    valida del tipo Clepsamia (reloj de arena con 2 lobulos y tubo central).
+
+    Algunos parametros se ajustan con limites duros para garantizar geometrias fisicas:
+    - El radio del cuello debe ser menor que ambos radios maximos.
+    - El radio del tubo central debe ser menor que el radio del cuello (con margen).
+    - La altura inferior del tubo debe estar dentro del dispositivo.
+    """
+    height = float(params["height_m"])
+    neck_height_ratio = float(params["neck_height_ratio"])
+    neck_radius = float(params["neck_radius_m"])
+    upper_max_r = float(params["upper_max_radius_m"])
+    lower_max_r = float(params["lower_max_radius_m"])
+    central_tube_radius = float(params["central_tube_radius_m"])
+
+    # Forzar que los radios maximos siempre sean mayores que el cuello (con margen).
+    upper_max_r = max(upper_max_r, neck_radius * 1.5)
+    lower_max_r = max(lower_max_r, neck_radius * 1.5)
+
+    # Forzar que el tubo central quepa por el cuello con margen.
+    central_tube_radius = min(central_tube_radius, neck_radius * 0.7)
+    # Pero el tubo central tampoco puede ser tan pequeno que sea cero.
+    central_tube_radius = max(central_tube_radius, 0.002)
+
+    # inlet_angle_deg ya no es parte del action space (axisimetria). Si el dict
+    # de params lo trae igual (warm-start desde un JSON viejo), lo respetamos;
+    # si no, usamos el default de la dataclass (-90.0).
+    inlet_angle_deg = float(params.get("inlet_angle_deg", -90.0))
+
     return ClassifierGeometry(
-        width_m=2.0 * max_radius,
-        depth_m=2.0 * max_radius,
         height_m=height,
-        trap_height_m=trap_height,
-        outlet_height_m=outlet_height,
-        inlet_height_m=inlet_height,
-        inlet_velocity_m_s=flow_velocity,
-        upward_velocity_m_s=flow_velocity,
-        body_top_radius_ratio=float(body_top_radius_ratio),
-        body_bottom_radius_ratio=float(body_bottom_radius_ratio),
-        overflow_tube_radius_ratio=float(overflow_tube_radius_ratio),
-        overflow_tube_bottom_radius_ratio=float(overflow_tube_bottom_radius_ratio),
-        overflow_tube_bottom_height_ratio=params["overflow_tube_bottom_height_ratio"],
-        overflow_tube_curve=params.get("overflow_tube_curve", 0.0),
-        cone_top_height_ratio=float(cone_top_height / height),
-        cone_neck_radius_ratio=float(cone_neck_radius_ratio),
-        trap_bottom_radius_ratio=float(trap_bottom_radius_ratio),
-        body_curve=params["body_curve"],
-        cone_curve=params["cone_curve"],
-        trap_curve=params["trap_curve"],
-        trap_floor_curve=params["trap_floor_curve"],
-        inlet_pitch_deg=params.get("inlet_pitch_deg", 0.0),
-        inlet_angle_deg=params.get("inlet_angle_deg", -90.0),
+        neck_height_ratio=neck_height_ratio,
+        neck_radius_m=neck_radius,
+        upper_max_radius_m=upper_max_r,
+        upper_max_position_ratio=float(params["upper_max_position_ratio"]),
+        lower_max_radius_m=lower_max_r,
+        lower_max_position_ratio=float(params["lower_max_position_ratio"]),
+        inlet_height_ratio=float(params["inlet_height_ratio"]),
+        inlet_pitch_deg=float(params["inlet_pitch_deg"]),
+        inlet_angle_deg=inlet_angle_deg,
+        inlet_yaw_deg=float(params["inlet_yaw_deg"]),
+        central_tube_radius_m=central_tube_radius,
+        central_tube_bottom_ratio=float(params["central_tube_bottom_ratio"]),
+        inlet_velocity_m_s=float(params["flow_velocity_m_s"]),
     )
 
 

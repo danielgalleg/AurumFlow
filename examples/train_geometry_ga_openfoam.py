@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+import matplotlib.pyplot as plt
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -41,16 +42,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mutation-sigma", type=float, default=0.25, help="Desviacion estandar de mutacion.")
     parser.add_argument("--tournament-size", type=int, default=3, help="Individuos por torneo.")
     parser.add_argument("--warm-start-jsons", nargs="+", help="Archivos best_geometry.json previos para sembrar la poblacion.")
+    parser.add_argument("--interactive", action="store_true", help="Pausa antes de cada generacion para aprobar/rechazar geometrias manualmente.")
     parser.add_argument("--output-dir", default="rl_runs/ga_openfoam", help="Directorio de salida.")
     return parser.parse_args()
 
 
 def params_to_action(params: dict[str, float]) -> np.ndarray:
     params = dict(params)
-    if "body_wall_length_ratio" not in params and "cone_top_height_ratio" in params:
-        params["body_wall_length_ratio"] = 1.0 - float(params["cone_top_height_ratio"])
-    if "trap_wall_length_ratio" not in params and "trap_height_ratio" in params:
-        params["trap_wall_length_ratio"] = float(params["trap_height_ratio"])
     action = np.zeros(len(ACTION_NAMES), dtype=np.float32)
     for idx, name in enumerate(ACTION_NAMES):
         if name not in params:
@@ -62,16 +60,42 @@ def params_to_action(params: dict[str, float]) -> np.ndarray:
 
 
 def cfd_reward(metrics_combined: dict[str, float]) -> float:
-    gold_recovery = metrics_combined.get("target_recovery_pct", 0.0) / 100.0
-    gold_loss = metrics_combined.get("target_loss_pct", 100.0) / 100.0
-    non_target_rejection = metrics_combined.get("non_target_rejection_pct", 0.0) / 100.0
-    contamination = metrics_combined.get("trapped_contamination_pct", 100.0) / 100.0
-    return float(
-        1.8 * gold_recovery
-        + 1.5 * non_target_rejection
-        - 3.0 * gold_loss
-        - 2.4 * contamination
-    )
+    """Funcion de recompensa MULTIPLICATIVA para Clepsamia.
+
+    Multiplicamos los tres factores deseables en vez de sumarlos, para que el
+    reward solo sea alto cuando los TRES son simultaneamente altos. Una metrica
+    perfecta NO puede compensar una mediocre (a diferencia del esquema sumado
+    anterior).
+
+        reward = 4 * recovery * purity * (1 - loss)
+
+    donde:
+        - recovery (0..1): fraccion del oro inyectado retenido dentro del dispositivo.
+        - purity   (0..1): pureza del concentrado retenido = 1 - contamination.
+        - 1 - loss (0..1): 1 menos la fraccion de oro que escapo por el outlet.
+
+    Maximo teorico = 4.0 (los tres en 1.0).
+
+    Comparacion con el esquema anterior (sumado), para el campeon previo
+    (recovery=1.00, purity=0.98, loss=0.00):
+        sumado: 2*1.0 + 2*(1-contam) - 2*0 - 2*contam ~= 3.88
+        mult:   4 * 1.00 * 0.98 * 1.00              = 3.92
+
+    Para una geometria 99.5/99.66 (sacrifica 0.5% oro por 3% mas de pureza):
+        mult:   4 * 0.995 * 0.9966 * 0.995          = 3.94  -> mejora real
+        sumado: 2*0.995 + 2*0.9966 - 2*0.005 - 2*(1-0.9966) = 3.97
+
+    El esquema multiplicativo penaliza mucho mas duro las geometrias que
+    sacrifican mucho de un factor (ej. recovery=0.5 con purity=1.0 da 2.0,
+    mientras que en sumado daba ~3.0). Eso fuerza al GA a buscar el balance.
+    """
+    gold_recovery = max(0.0, metrics_combined.get("target_recovery_pct", 0.0) / 100.0)
+    gold_loss = max(0.0, metrics_combined.get("target_loss_pct", 100.0) / 100.0)
+    contamination = max(0.0, metrics_combined.get("trapped_contamination_pct", 100.0) / 100.0)
+
+    purity = max(0.0, 1.0 - contamination)
+    no_loss = max(0.0, 1.0 - gold_loss)
+    return float(4.0 * gold_recovery * purity * no_loss)
 
 
 def evaluate_action_cfd(payload: tuple[int, int, list[float], str, argparse.Namespace]) -> dict[str, Any]:
@@ -89,7 +113,19 @@ def evaluate_action_cfd(payload: tuple[int, int, list[float], str, argparse.Name
     try:
         geometry = parameters_to_geometry(params)
         geometry.validate()
-        
+
+        # Pre-filtro de cell-count: estimamos cuantas celdas tendria snappyHexMesh
+        # antes de llamar a OpenFOAM y rechazamos las geometrias que generarian
+        # mallas demasiado caras. Asumimos cellSize = 2R/base_cells en X y Z, y
+        # nY = H/cellSize en altura. Factor 1.7 cubre el refinamiento de capa
+        # cercana a pared. Threshold calibrado a ~330k cells (~3 min de mesh+CFD).
+        bb_radius = geometry.cylinder_radius_m
+        cell_size = (2.0 * bb_radius) / max(1, args.base_cells)
+        raw_cells = args.base_cells * args.base_cells * (geometry.height_m / max(cell_size, 1e-6))
+        predicted_cells = int(raw_cells * 1.7)
+        if predicted_cells > 330_000:
+            raise ValueError(f"Mesh estimado demasiado grande ({predicted_cells} cells > 330k)")
+
         geom_json = cand_dir / "geometry.json"
         geom_json.write_text(json.dumps({"params": params, "geometry": asdict(geometry)}, indent=2))
         
@@ -174,6 +210,186 @@ def evaluate_action_cfd(payload: tuple[int, int, list[float], str, argparse.Name
     }
 
 
+def interactive_review(population: list[np.ndarray], generation: int, out_dir: Path, rng: np.random.Generator, args: argparse.Namespace) -> list[np.ndarray]:
+    if not args.interactive:
+        return population
+        
+    review_dir = out_dir / f"review_gen_{generation:03d}"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    
+    current_pop = list(population)
+    
+    def generate_2d_profile(geom):
+        y_samples = 200
+        y = np.linspace(0, geom.height_m, y_samples)
+        r_outer = np.array([geom.allowed_radius_at_height(yi) for yi in y])
+        # Tubo central: solo existe entre central_tube_bottom_height_m y height_m
+        y_tube = np.linspace(geom.central_tube_bottom_height_m, geom.height_m, max(20, y_samples // 4))
+        r_tube = np.full_like(y_tube, geom.central_tube_radius_m)
+        return y, r_outer, y_tube, r_tube
+
+    fig, ax = plt.subplots(figsize=(6, 8))
+    
+    while True:
+        print(f"\n--- REVISION INTERACTIVA: Generacion {generation} ---")
+        print(f"Generando graficos de {len(current_pop)} individuos en: {review_dir}")
+        
+        for i, action in enumerate(current_pop):
+            img_path = review_dir / f"ind_{i:03d}.png"
+            if img_path.exists():
+                continue
+                
+            ax.clear()
+            try:
+                params = action_to_parameters(action)
+                geom = parameters_to_geometry(params)
+                geom.validate()
+                
+                max_radius = max(0.1, geom.cylinder_radius_m)
+                max_height = max(0.35, geom.height_m)
+                ax.set_xlim(-max_radius * 1.1, max_radius * 1.1)
+                ax.set_ylim(-0.02, max_height * 1.05)
+                ax.set_aspect('equal')
+                
+                y, r_outer, y_tube, r_tube = generate_2d_profile(geom)
+                
+                # Polygono cuerpo cerrado: lado derecho desde abajo hasta tope, luego tubo central bajando, despues volviendo al eje
+                outer_x = np.concatenate([
+                    [0.0],                        # eje en y=0 (fondo cerrado)
+                    r_outer,                      # pared exterior subiendo
+                    [r_tube[-1]],                 # tope: empalme con tubo central
+                    r_tube[::-1],                 # pared interna del tubo bajando
+                    [0.0],                        # boca inferior del tubo (centro)
+                ])
+                outer_y = np.concatenate([
+                    [0.0],
+                    y,
+                    [geom.height_m],
+                    y_tube[::-1],
+                    [y_tube[0]],
+                ])
+                full_x = np.concatenate([outer_x, -outer_x[::-1]])
+                full_y = np.concatenate([outer_y, outer_y[::-1]])
+                ax.fill(full_x, full_y, color='cyan', alpha=0.3)
+                
+                # Pared exterior (curva azul) - desde y=0 hasta y=height empalmando con el tubo
+                wall_x = np.concatenate([[0.0], r_outer, [r_tube[-1]]])
+                wall_y = np.concatenate([[0.0], y, [geom.height_m]])
+                ax.plot(wall_x, wall_y, color='blue', linewidth=2)
+                ax.plot(-wall_x, wall_y, color='blue', linewidth=2)
+                
+                # Tubo central (rojo)
+                ax.plot(r_tube, y_tube, color='red', linewidth=3)
+                ax.plot(-r_tube, y_tube, color='red', linewidth=3)
+                ax.plot([-r_tube[0], r_tube[0]], [y_tube[0], y_tube[0]], color='red', linewidth=2, linestyle='--', alpha=0.5)
+                
+                # Marcar cuello con linea punteada
+                ax.axhline(y=geom.neck_height_m, color='gray', linestyle=':', alpha=0.4)
+                ax.text(max_radius * 0.95, geom.neck_height_m, f'Cuello',
+                        color='gray', va='bottom', ha='right', fontsize=8)
+                
+                # Inlet
+                inlet_y = geom.inlet_height_m
+                inlet_x = geom.allowed_radius_at_height(inlet_y)
+                inlet_pitch = params.get('inlet_pitch_deg', 0.0)
+                inlet_yaw = params.get('inlet_yaw_deg', 70.0)
+                ax.plot(inlet_x, inlet_y, marker='o', color='green', markersize=8, zorder=5)
+                ax.plot(-inlet_x, inlet_y, marker='o', color='green', markersize=8, zorder=5)
+
+                # En el corte 2D solo se ve la componente RADIAL+VERTICAL del chorro.
+                # La componente tangencial (perpendicular al corte) se indica como anillo
+                # alrededor del punto de entrada: anillo grande = mas tangencial.
+                v_len_full = max_radius * 0.4
+                v_len_radial = v_len_full * np.cos(np.radians(inlet_yaw))  # se acorta con yaw alto
+                dx = -v_len_radial * np.cos(np.radians(inlet_pitch))
+                dy = v_len_radial * np.sin(np.radians(inlet_pitch))
+                ax.annotate('', xy=(inlet_x + dx, inlet_y + dy), xytext=(inlet_x, inlet_y),
+                            arrowprops=dict(facecolor='green', edgecolor='green', width=2, headwidth=8, shrink=0), zorder=4)
+                ax.annotate('', xy=(-inlet_x - dx, inlet_y + dy), xytext=(-inlet_x, inlet_y),
+                            arrowprops=dict(facecolor='green', edgecolor='green', width=2, headwidth=8, shrink=0), zorder=4)
+                # Indicador visual de tangencialidad: circulo cuyo radio crece con sin(yaw)
+                tang_r = max_radius * 0.10 * np.sin(np.radians(inlet_yaw))
+                if tang_r > 1e-4:
+                    circle1 = plt.Circle((inlet_x, inlet_y), tang_r, color='orange', fill=False, linewidth=2, zorder=4)
+                    circle2 = plt.Circle((-inlet_x, inlet_y), tang_r, color='orange', fill=False, linewidth=2, zorder=4)
+                    ax.add_patch(circle1)
+                    ax.add_patch(circle2)
+
+                ax.set_title(
+                    f"Ind {i} | Pitch: {inlet_pitch:+.0f}° | Yaw: {inlet_yaw:.0f}° | "
+                    f"Vel: {params.get('flow_velocity_m_s', 0):.2f} m/s"
+                )
+                ax.grid(True, linestyle='--', alpha=0.4)
+                ax.set_xlabel('Radio (m)')
+                ax.set_ylabel('Altura (m)')
+            except Exception as e:
+                ax.text(0.5, 0.5, f"INVALIDO\n{e}", ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f"Individuo {i} (INVALIDO)")
+                
+            fig.savefig(img_path, dpi=100)
+            
+        print("Graficos actualizados.")
+        print(f"\n>>> ABRE LA CARPETA: {review_dir}")
+        print(">>> BORRA las imagenes de las geometrias que NO quieres simular.")
+        print(">>> Las imagenes que dejes en la carpeta seran las geometrias aceptadas.")
+        print(">>> Cuando termines de borrar, presiona ENTER para continuar.")
+        print(">>> O escribe 'regen' para regenerar reemplazos para las que borraste y volver a revisar.")
+        print(">>> O escribe 'all' para rechazar todas y volver a generar.")
+        
+        try:
+            resp = input("Accion: ").strip().lower()
+        except EOFError:
+            print("No hay terminal interactiva. Saltando revision.")
+            break
+            
+        # Detectar que imagenes el usuario dejo en la carpeta (las que conserva)
+        kept_indices = set()
+        for f in review_dir.glob("ind_*.png"):
+            try:
+                idx = int(f.stem.split("_")[1])
+                kept_indices.add(idx)
+            except (ValueError, IndexError):
+                continue
+                
+        all_indices = set(range(len(current_pop)))
+        deleted_indices = all_indices - kept_indices
+        
+        if resp == 'all':
+            print("Rechazando TODAS las geometrias y regenerando desde cero...")
+            for img in review_dir.glob("ind_*.png"):
+                img.unlink()
+            for idx in range(len(current_pop)):
+                current_pop[idx] = rng.uniform(-1.0, 1.0, size=len(ACTION_NAMES)).astype(np.float32)
+            continue
+            
+        if resp == 'regen':
+            if not deleted_indices:
+                print("No borraste ninguna imagen. Nada que regenerar.")
+                continue
+            print(f"Regenerando {len(deleted_indices)} reemplazos para las imagenes borradas...")
+            good_indices = sorted(kept_indices)
+            for idx in deleted_indices:
+                if good_indices and rng.random() < 0.7:
+                    base_idx = int(rng.choice(good_indices))
+                    base = current_pop[base_idx]
+                    mutated = base + rng.normal(0.0, 0.25, size=base.shape)
+                    current_pop[idx] = np.clip(mutated, -1.0, 1.0).astype(np.float32)
+                else:
+                    current_pop[idx] = rng.uniform(-1.0, 1.0, size=len(ACTION_NAMES)).astype(np.float32)
+            continue
+            
+        # Default (Enter): aceptar solo las que quedaron
+        if deleted_indices:
+            print(f"Aceptando {len(kept_indices)} geometrias. Descartadas {len(deleted_indices)}.")
+            current_pop = [current_pop[i] for i in sorted(kept_indices)]
+        else:
+            print(f"Aceptando todas las {len(current_pop)} geometrias.")
+        break
+                    
+    plt.close(fig)
+    return current_pop
+
+
 def init_population(args: argparse.Namespace, rng: np.random.Generator) -> list[np.ndarray]:
     population: list[np.ndarray] = []
     
@@ -182,11 +398,9 @@ def init_population(args: argparse.Namespace, rng: np.random.Generator) -> list[
             if Path(ws_json).is_file():
                 try:
                     payload = json.loads(Path(ws_json).read_text(encoding="utf-8"))
-                    if "action" in payload:
-                        action = np.asarray(payload["action"], dtype=np.float32)
-                        population.append(action)
-                    elif "params" in payload:
-                        action = params_to_action(payload["params"])
+                    if "params" in payload:
+                        params = payload["params"]
+                        action = params_to_action(params)
                         population.append(action)
                     print(f"Warm start inyectado desde {ws_json}")
                     
@@ -275,6 +489,8 @@ def main() -> None:
     best_result: dict[str, Any] | None = None
 
     for generation in range(args.generations):
+        population = interactive_review(population, generation, out_dir, rng, args)
+        
         payloads = [
             (generation, i, pop.tolist(), str(out_dir), args)
             for i, pop in enumerate(population)

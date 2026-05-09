@@ -318,9 +318,7 @@ def write_cloud_properties(
             }}"""
         for patch in (
             patches["outer_wall"],
-            patches["roof"],
-            patches["overflow_tube_wall"],
-            patches["trap_floor"],
+            patches["central_tube_wall"],
         )
     )
     collision_block = "    collisionModel none;\n"
@@ -423,7 +421,7 @@ subModels
     {{
         patches
         (
-            {patches["overflow_mouth"]}
+            {patches["central_tube_top"]}
             {{
                 type escape;
             }}
@@ -431,23 +429,13 @@ subModels
             {{
                 type escape;
             }}
-            {patches["trap_floor"]}
-            {{
-                type stick;
-            }}
             {patches["outer_wall"]}
             {{
                 type rebound;
                 e    0.85;
                 mu   0.35;
             }}
-            {patches["roof"]}
-            {{
-                type rebound;
-                e    0.85;
-                mu   0.35;
-            }}
-            {patches["overflow_tube_wall"]}
+            {patches["central_tube_wall"]}
             {{
                 type rebound;
                 e    0.85;
@@ -479,10 +467,8 @@ def mesh_patch_names(stl_prefix: str) -> dict[str, str]:
     return {
         "outer_wall": f"classifier_{stl_prefix}_outer_wall",
         "inlet": f"classifier_{stl_prefix}_inlet",
-        "roof": f"classifier_{stl_prefix}_roof",
-        "overflow_tube_wall": f"classifier_{stl_prefix}_overflow_tube_wall",
-        "overflow_mouth": f"classifier_{stl_prefix}_overflow_mouth",
-        "trap_floor": f"classifier_{stl_prefix}_trap_floor",
+        "central_tube_wall": f"classifier_{stl_prefix}_central_tube_wall",
+        "central_tube_top": f"classifier_{stl_prefix}_central_tube_top",
     }
 
 
@@ -502,16 +488,16 @@ def write_manifest(
         "collision_model": collision_model,
         "material": material.__dict__,
         "initial_count": int(len(positions)),
-        "trap_height_m": float(metadata["geometry"]["trap_height_m"]),
-        "trap_bottom_radius_m": float(metadata["derived"]["trap_bottom_radius_m"]),
-        "overflow_tube_radius_m": float(metadata["derived"]["overflow_tube_radius_m"]),
-        "overflow_tube_bottom_height_m": float(metadata["derived"]["overflow_tube_bottom_height_m"]),
+        "device_type": metadata.get("device_type", "clepsamia_hourglass"),
+        "neck_height_m": float(metadata["derived"].get("neck_height_m", 0.0)),
+        "neck_radius_m": float(metadata["derived"].get("neck_radius_m", 0.0)),
+        "central_tube_radius_m": float(metadata["derived"]["central_tube_radius_m"]),
+        "central_tube_bottom_height_m": float(metadata["derived"]["central_tube_bottom_height_m"]),
         "height_m": float(metadata["derived"]["height_m"]),
         "notes": [
-            "Caso por material: rho0 es unico por cloud en icoUncoupledKinematicParcelFoam.",
-            "El campo U se copia desde el caso CFD y se usa como flujo congelado.",
-            "Esta validacion incluye arrastre, gravedad y rebote/stick de paredes.",
-            "Use --collision-model pairCollision para activar colision parcel-parcel simple con mayor costo.",
+            "Geometria 'Clepsamia' (reloj de arena): solo 2 puertos (inlet tangencial, central tube outlet).",
+            "Particulas que escapan por central_tube_top o inlet se consideran salidas.",
+            "El oro objetivo deberia sedimentar en el fondo del lobulo inferior por gravedad.",
         ],
     }
     (case_dir / "particle_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

@@ -43,18 +43,30 @@ def read_metadata(path: Path) -> dict:
 
 
 def inlet_velocity_vector(metadata: dict) -> tuple[float, float, float]:
+    """Construye el vector de velocidad del inlet a partir de:
+      - inlet_angle_deg: posicion angular del parche en la pared del cilindro.
+      - inlet_pitch_deg: ángulo vertical (positivo => chorro hacia arriba).
+      - inlet_yaw_deg:   tangencialidad (0 = radial puro, 90 = tangente puro).
+
+    El vector resultante tiene magnitud exactamente igual a inlet_velocity_m_s.
+    """
     velocity = float(metadata["geometry"]["inlet_velocity_m_s"])
     angle = math.radians(float(metadata["derived"].get("inlet_angle_deg", -90.0)))
     pitch = math.radians(float(metadata["derived"].get("inlet_pitch_deg", 0.0)))
+    yaw = math.radians(float(metadata["derived"].get("inlet_yaw_deg", 70.0)))
+
     inward = (-math.cos(angle), 0.0, -math.sin(angle))
     tangent = (-math.sin(angle), 0.0, math.cos(angle))
-    swirl_weight = 0.75
-    radial_weight = 0.65
-    
-    vx = velocity * math.cos(pitch) * (radial_weight * inward[0] + swirl_weight * tangent[0])
-    vz = velocity * math.cos(pitch) * (radial_weight * inward[2] + swirl_weight * tangent[2])
+
+    cy = math.cos(yaw)
+    sy = math.sin(yaw)
+    horiz_x = cy * inward[0] + sy * tangent[0]
+    horiz_z = cy * inward[2] + sy * tangent[2]
+
+    horizontal_speed = velocity * math.cos(pitch)
+    vx = horizontal_speed * horiz_x
+    vz = horizontal_speed * horiz_z
     vy = velocity * math.sin(pitch)
-    
     return (vx, vy, vz)
 
 
@@ -62,10 +74,8 @@ def patch_names(stl_prefix: str) -> dict[str, str]:
     return {
         "outer_wall": f"{stl_prefix}_outer_wall",
         "inlet": f"{stl_prefix}_inlet",
-        "roof": f"{stl_prefix}_roof",
-        "overflow_tube_wall": f"{stl_prefix}_overflow_tube_wall",
-        "overflow_mouth": f"{stl_prefix}_overflow_mouth",
-        "trap_floor": f"{stl_prefix}_trap_floor",
+        "central_tube_wall": f"{stl_prefix}_central_tube_wall",
+        "central_tube_top": f"{stl_prefix}_central_tube_top",
     }
 
 
@@ -144,13 +154,15 @@ def write_surface_features(case_dir: Path, stl_name: str) -> None:
 def write_snappy(case_dir: Path, metadata: dict, stl_name: str, stl_prefix: str, refinement_level: int) -> None:
     height = float(metadata["derived"]["height_m"])
     max_radius = float(metadata["derived"]["max_domain_radius_m"])
-    body_top_radius = float(metadata["derived"].get("body_top_radius_m", 0.45 * max_radius))
-    overflow_radius = float(metadata["derived"]["overflow_tube_radius_m"])
+    upper_max_radius = float(metadata["derived"].get("upper_max_radius_m", 0.6 * max_radius))
+    central_tube_radius = float(metadata["derived"]["central_tube_radius_m"])
+    neck_height = float(metadata["derived"].get("neck_height_m", 0.5 * height))
+    upper_max_height = float(metadata["derived"].get("upper_max_height_m", 0.7 * height))
     patches = patch_names(stl_prefix)
-    location_y = 0.52 * height
-    # Keep a point in the annular classifier body, away from the central overflow
-    # tube/axis. A point at x=z=0 can make snappyHexMesh retain the exterior box.
-    location_x = max(2.2 * overflow_radius, min(0.35 * max_radius, 0.75 * body_top_radius))
+    # Punto que claramente est\u00e1 dentro del fluido del l\u00f3bulo superior, lejos del eje central
+    # (donde est\u00e1 el tubo) y lejos de las paredes.
+    location_y = 0.5 * (neck_height + upper_max_height)
+    location_x = max(2.5 * central_tube_radius, 0.40 * upper_max_radius)
     text = foam_header("dictionary", "snappyHexMeshDict") + f"""
 castellatedMesh true;
 snap            true;
@@ -189,10 +201,8 @@ castellatedMeshControls
             {{
                 {patches["outer_wall"]} {{ level ({refinement_level} {refinement_level}); patchInfo {{ type wall; }} }}
                 {patches["inlet"]} {{ level ({refinement_level + 1} {refinement_level + 1}); patchInfo {{ type patch; }} }}
-                {patches["roof"]} {{ level ({refinement_level} {refinement_level}); patchInfo {{ type wall; }} }}
-                {patches["overflow_tube_wall"]} {{ level ({refinement_level + 1} {refinement_level + 1}); patchInfo {{ type wall; }} }}
-                {patches["overflow_mouth"]} {{ level ({refinement_level + 1} {refinement_level + 1}); patchInfo {{ type patch; }} }}
-                {patches["trap_floor"]} {{ level ({refinement_level} {refinement_level}); patchInfo {{ type wall; }} }}
+                {patches["central_tube_wall"]} {{ level ({refinement_level + 1} {refinement_level + 1}); patchInfo {{ type wall; }} }}
+                {patches["central_tube_top"]} {{ level ({refinement_level + 1} {refinement_level + 1}); patchInfo {{ type patch; }} }}
             }}
         }}
     }}
@@ -376,9 +386,7 @@ def write_initial_fields(case_dir: Path, metadata: dict, stl_prefix: str) -> Non
     ux, uy, uz = inlet_velocity_vector(metadata)
     wall_patches = [
         patches["outer_wall"],
-        patches["roof"],
-        patches["overflow_tube_wall"],
-        patches["trap_floor"],
+        patches["central_tube_wall"],
     ]
     wall_u_entries = "\n".join(
         f"""    {patch}
@@ -407,7 +415,7 @@ boundaryField
         type fixedValue;
         value uniform ({ux:.8f} {uy:.8f} {uz:.8f});
     }}
-    {patches["overflow_mouth"]}
+    {patches["central_tube_top"]}
     {{
         type pressureInletOutletVelocity;
         value uniform (0 0 0);
@@ -429,7 +437,7 @@ boundaryField
     {{
         type zeroGradient;
     }}
-    {patches["overflow_mouth"]}
+    {patches["central_tube_top"]}
     {{
         type fixedValue;
         value uniform 0;

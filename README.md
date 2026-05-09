@@ -1,48 +1,45 @@
 # AurumFlow
 
-Experimental tools for designing and validating a compact hydraulic classifier/cyclone for small-scale alluvial gold separation.
+Experimental tools for designing and validating a compact hydraulic classifier for small-scale alluvial gold separation.
 
-The project combines fast geometry exploration, evolutionary optimization, OpenFOAM CFD export, particle tracking, and ParaView visualization. It is intended as a research and prototyping aid, not as a certified mining, safety, or recovery guarantee.
+The project combines advanced parametric geometry exploration, evolutionary optimization, OpenFOAM CFD export, multi-material particle tracking, and ParaView visualization. It is intended as a research and prototyping aid for creating highly efficient, low-power separation devices, not as a certified mining, safety, or recovery guarantee.
 
 ## Project Status
 
-This repository is experimental and under active development.
+This repository is experimental and under active development. The current focus has shifted from traditional hydrocyclones to **upflow elutriators** after the Genetic Algorithm (GA) discovered that slow, upward-directed flows are vastly superior for achieving >99% pure concentrates while operating on low-power 12V diaphragm pumps.
 
 Current capabilities:
 
-- A simple 0-D process simulator for rough mass-balance thinking.
-- A local 3D particle visualizer for rapid geometry exploration.
-- **"Geometry 2.0"**: Advanced 3D parameterization including miniaturization (backpack-sized), 12V solar pump limits, independent overflow tube curvature (flared/tapered tips), and 3D inlet pitch/angle.
-- **OpenFOAM-Driven Genetic Algorithm**: Direct coupling of evolutionary optimization with OpenFOAM CFD evaluation using mass-based metrics (`train_geometry_ga_openfoam.py`).
-- STL/metadata export for OpenFOAM.
-- OpenFOAM case generation for internal water-flow validation.
-- Native OpenFOAM particle tracking by material class.
-- ParaView automation for screenshots, orbit videos, streamlines, and particle overlays.
+- **"Clepsamia" (Hourglass) Geometry**: A fully C¹-continuous 3D parameterization featuring two curved lobes, a narrow neck, a central outlet tube, and an actively positioned/angled inlet. There are no flat surfaces or vertices.
+- **Multiplicative Reward Function**: The GA evaluates designs using a strict `4.0 * recovery * purity * (1 - loss)` formula, penalizing any geometry that sacrifices gold recovery for sediment rejection or vice versa.
+- **OpenFOAM-Driven Genetic Algorithm**: Direct coupling of evolutionary optimization with high-fidelity OpenFOAM CFD evaluation (`train_geometry_ga_openfoam.py`).
+- **Interactive File-Based Review**: The GA allows manual filtering of geometries before expensive CFD runs by simply deleting unwanted 2D profile images from a folder.
+- **Multi-Material Particle Tracking**: Native OpenFOAM particle tracking evaluating Gold (target), Quartz Sand, and Magnetite simultaneously.
+- **Automated STL/Mesh/Case Generation**: Zero-touch generation of `snappyHexMesh` and `simpleFoam` fluid flow cases.
 
-Important limitation: the local visual simulator is not a full CFD/DEM solver. It is useful for generating hypotheses, but final design decisions are now driven by OpenFOAM CFD validations.
+Important limitation: while OpenFOAM is robust, the current particle solver (`icoUncoupledKinematicParcelFoam`) is uncoupled (particles don't affect fluid or each other). The next step for validating the dense concentrate bed is full CFD+DEM.
 
 ## Repository Layout
 
 ```text
 examples/
-  run_process.py                    # 0-D process example
-  run_classifier_3d.py              # local visual classifier simulator
-  train_geometry_ga.py              # genetic geometry optimizer
-  train_geometry_rl.py              # RL geometry optimizer
-  export_geometry_cfd.py            # geometry export for CFD/SPH
-  create_openfoam_case.py           # OpenFOAM water-flow case generator
-  create_openfoam_particle_case.py  # OpenFOAM particle cases by material
-  analyze_openfoam_particles.py     # particle metrics post-processing
-  evaluate_geometry_openfoam.py     # hybrid GA/OpenFOAM evaluator
-  evaluate_geometry.py              # local batch geometry evaluation
-  optimize_sluice.py                # 0-D sluice parameter sweep
-  paraview_openfoam_view.py         # scripted ParaView visualization
+  train_geometry_ga_openfoam.py     # Main hybrid GA/OpenFOAM optimizer with interactive review
+  evaluate_geometry_openfoam.py     # Single geometry OpenFOAM evaluation script
+  export_geometry_cfd.py            # Generates STL and metadata from Clepsamia geometry
+  create_openfoam_case.py           # Configures simpleFoam fluid cases (inlet yaw/pitch)
+  create_openfoam_particle_case.py  # Configures multi-material particle tracking
+  analyze_openfoam_particles.py     # Calculates recovery/rejection/contamination metrics
+  plot_all_evaluations.py           # 2D profile grid of all evaluated geometries
+  animate_evolution.py              # Creates GIFs of the GA's progression
+  make_dome_seed.py                 # Generates warm-start JSONs
+  paraview_openfoam_view.py         # Scripted ParaView visualization
 
-visual_sim/                         # geometry, physics, metrics, viewer, RL environment
-simulador_proceso/                  # rough 0-D process simulator
+visual_sim/
+  geometry.py                       # C¹-continuous Clepsamia math and parameterization
+  rl_env.py                         # Action spaces, parameter bounds, and physics config
 ```
 
-Generated outputs such as `rl_runs/`, `cfd_cases/`, `cfd_exports/`, `cfd_particle_cases/`, `cfd_sweeps/`, images, and videos are intentionally ignored by Git.
+Generated outputs such as `rl_runs/`, `cfd_cases/`, `cfd_exports/`, images, and videos are intentionally ignored by Git.
 
 ## Installation
 
@@ -65,184 +62,96 @@ paraview
 pvpython --version
 ```
 
-On Ubuntu, `pvpython` may need:
-
-```bash
-export PYTHONPATH=/usr/lib/python3/dist-packages
-```
-
 ## Quick Start
 
-Run the rough process model:
+The recommended workflow is to run the OpenFOAM-coupled Genetic Algorithm. This script automatically meshes, simulates fluid flow, tracks particles, and computes the multiplicative reward.
 
-```bash
-python3 examples/run_process.py
-```
+### 1. Run the Optimizer
 
-Run the local classifier visualizer:
-
-```bash
-python3 examples/run_classifier_3d.py
-```
-
-Headless local simulation:
-
-```bash
-python3 examples/run_classifier_3d.py --headless --frames 3000 --particles 5000
-```
-
-Run a genetic optimization directly coupled with OpenFOAM (Recommended):
+You can warm-start the optimizer using an existing highly-performing geometry JSON to speed up convergence:
 
 ```bash
 python3 examples/train_geometry_ga_openfoam.py \
-  --generations 40 \
-  --population 96 \
-  --base-cells 32 \
-  --particle-end-time 6.0 \
-  --parcels-scale 0.05 \
+  --generations 60 \
+  --population 64 \
+  --base-cells 44 \
+  --particle-end-time 4.0 \
+  --parcels-scale 0.04 \
   --cores-per-eval 2 \
   --n-jobs 7 \
-  --output-dir rl_runs/ga_openfoam_med_res
+  --output-dir rl_runs/ga_clepsamia_run \
+  --warm-start-jsons rl_runs/ga_clepsamia_v5_max_bounds/best_geometry.json \
+  --mutation-prob 0.40 \
+  --mutation-sigma 0.30
 ```
 
-Run a fast local genetic optimization (for quick testing, not physically accurate):
+### 2. Interactive Review
+
+If the `--interactive` flag is set (default behavior), the script will pause before every generation. It generates 2D profiles of all candidate geometries in a `review_gen_XXX` folder.
+- **To accept**: Leave the image in the folder.
+- **To reject**: Delete the image file.
+- Type `Enter` in the terminal to proceed, `regen` to replace deleted geometries with mutations of the survivors, or `all` to reject everything and try again.
+
+### 3. Analyze Results
+
+Once the run completes (or is paused), you can generate a grid showing all tested geometries:
 
 ```bash
-python3 examples/train_geometry_ga.py \
-  --generations 50 \
-  --population 64 \
-  --n-jobs 8 \
-  --particles 1600 \
-  --frames 3000 \
-  --substeps 3 \
-  --feed-duration 2.5 \
-  --output-dir rl_runs/ga_geometry
+python3 examples/plot_all_evaluations.py \
+  --run-dir rl_runs/ga_clepsamia_run
 ```
 
-## OpenFOAM Workflow
+To create an animation of the evolutionary progress:
 
-Export a candidate geometry:
+```bash
+python3 examples/animate_evolution.py \
+  --run-dir rl_runs/ga_clepsamia_run
+```
+
+## Single Geometry Evaluation Workflow
+
+If you want to manually test a specific JSON geometry without running the GA:
+
+### 1. Export the STL
 
 ```bash
 python3 examples/export_geometry_cfd.py \
-  --geometry-json rl_runs/ga_geometry/best_geometry.json \
-  --output-dir cfd_exports/candidate_cfd \
-  --axial-samples 120 \
-  --radial-samples 24 \
-  --angular-segments 72 \
-  --name candidate
+  --geometry-json rl_runs/ga_clepsamia_run/best_geometry.json \
+  --output-dir cfd_exports/manual_test \
+  --name clepsamia
 ```
 
-Create an OpenFOAM case:
+### 2. Evaluate with OpenFOAM
 
-```bash
-python3 examples/create_openfoam_case.py \
-  --export-dir cfd_exports/candidate_cfd \
-  --stl-name candidate_internal_volume.stl \
-  --metadata cfd_exports/candidate_cfd/candidate_metadata.json \
-  --case-dir cfd_cases/candidate_simple \
-  --base-cells 32 \
-  --refinement-level 1
-```
-
-Run OpenFOAM:
-
-```bash
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/work opencfd/openfoam-default:latest \
-  bash -lc 'cd /work/cfd_cases/candidate_simple && ./Allclean && ./Allrun && ./AllrunFlow'
-```
-
-Visualize with ParaView:
-
-```bash
-pvpython examples/paraview_openfoam_view.py \
-  --foam cfd_cases/candidate_simple/candidate_simple.foam \
-  --camera iso \
-  --screenshot vista_3d.png
-```
-
-## Particle Validation
-
-Create particle tracking cases:
-
-```bash
-python3 examples/create_openfoam_particle_case.py \
-  --base-case cfd_cases/candidate_simple \
-  --metadata cfd_exports/candidate_cfd/candidate_metadata.json \
-  --output-root cfd_particle_cases/candidate_particles \
-  --end-time 0.5 \
-  --write-interval 0.05
-```
-
-Run all material cases:
-
-```bash
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/work opencfd/openfoam-default:latest \
-  bash -lc 'cd /work/cfd_particle_cases/candidate_particles && ./AllrunParticles'
-```
-
-Analyze metrics:
-
-```bash
-python3 examples/analyze_openfoam_particles.py \
-  --cases-root cfd_particle_cases/candidate_particles
-```
-
-Overlay particles in ParaView:
-
-```bash
-pvpython examples/paraview_openfoam_view.py \
-  --foam cfd_cases/candidate_simple/candidate_simple.foam \
-  --particles-csv cfd_particle_cases/candidate_particles/particles_latest.csv \
-  --no-glyph \
-  --slice none \
-  --screenshot aurumflow_cfd.png
-```
-
-## Hybrid Optimization Strategy
-
-The local simulator should not be treated as the final judge of physical performance. The recommended workflow is multi-fidelity:
-
-```text
-fast local GA/RL exploration
-  -> diverse candidate geometries
-  -> low-resolution OpenFOAM re-ranking
-  -> particle validation
-  -> MPPICFoam or CFD+DEM for finalists
-  -> physical bench testing
-```
-
-Run an OpenFOAM re-ranking pass from a GA result:
+This script automates `create_openfoam_case.py`, `create_openfoam_particle_case.py`, running the Docker container, and `analyze_openfoam_particles.py`:
 
 ```bash
 python3 examples/evaluate_geometry_openfoam.py \
-  --episodes-csv rl_runs/ga_geometry/episodes.csv \
-  --top-n 12 \
-  --output-root cfd_sweeps/ga_top12 \
-  --base-cells 24 \
-  --refinement-level 1 \
-  --particle-end-time 0.1 \
-  --parcels-scale 0.05
+  --geometry-json rl_runs/ga_clepsamia_run/best_geometry.json \
+  --output-root cfd_cases/manual_test \
+  --name-prefix test \
+  --base-cells 44 \
+  --particle-end-time 5.0
 ```
 
-Use the best OpenFOAM-ranked geometry as a warm start:
+### 3. Visualize with ParaView
 
 ```bash
-python3 examples/train_geometry_ga.py \
-  --warm-start-json cfd_sweeps/ga_top12/best_cfd_geometry.json \
-  --output-dir rl_runs/ga_after_cfd
+pvpython examples/paraview_openfoam_view.py \
+  --foam cfd_cases/manual_test/test_000/case/case.foam \
+  --particles-csv cfd_cases/manual_test/test_000/particles/particles_latest.csv
 ```
 
 ## CFD+DEM Direction
 
-OpenFOAM native particle tracking is useful but not full DEM.
+OpenFOAM native particle tracking is extremely fast for optimization but does not model inter-particle collisions or the displacement of fluid by a dense bed of trapped concentrate.
 
 Recommended next fidelity levels:
 
 - `MPPICFoam`: native OpenFOAM option for dense particle clouds with cell-averaged collision/packing behavior.
-- `DPMFoam`: native coupled particle solver with parcel collision support, but can be costly.
-- YADE + OpenFOAM: open-source DEM with Python scripting and MPI coupling; promising for final high-fidelity validation.
-- CFDEM + LIGGGHTS or CFDEM-PFM: established GPL CFD+DEM coupling options, but installation/version compatibility can be harder.
+- `DPMFoam`: native coupled particle solver with parcel collision support.
+- YADE + OpenFOAM: open-source DEM with Python scripting and MPI coupling.
+- CFDEM + LIGGGHTS: established GPL CFD+DEM coupling options.
 
 ## Safety And Validation
 
@@ -261,8 +170,7 @@ Contributions are welcome. Useful areas include:
 - better particle/material presets;
 - geometry constraints for manufacturability;
 - validation against bench-test data;
-- ParaView visualization improvements;
-- documentation and reproducible examples.
+- ParaView visualization improvements.
 
 Before opening a pull request, please keep generated outputs out of Git and prefer small, reviewable changes.
 

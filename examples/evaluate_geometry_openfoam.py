@@ -30,7 +30,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refinement-level", type=int, default=1, help="Refinamiento snappyHexMesh.")
     parser.add_argument("--cores", type=int, default=14, help="Numero de nucleos para MPI.")
     parser.add_argument("--axial-samples", type=int, default=96, help="Muestras axiales del STL.")
-    parser.add_argument("--radial-samples", type=int, default=20, help="Muestras radiales del piso/trampa.")
     parser.add_argument("--angular-segments", type=int, default=56, help="Segmentos angulares del STL.")
     parser.add_argument("--particle-end-time", type=float, default=0.1, help="Tiempo de tracking de particulas.")
     parser.add_argument("--particle-write-interval", type=float, default=0.05, help="Intervalo de escritura particulas.")
@@ -214,8 +213,6 @@ def run_candidate(
             str(export_dir),
             "--axial-samples",
             str(args.axial_samples),
-            "--radial-samples",
-            str(args.radial_samples),
             "--angular-segments",
             str(args.angular_segments),
             "--name",

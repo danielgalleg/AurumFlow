@@ -15,25 +15,13 @@ VECTOR_RE = re.compile(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analiza resultados lagrangianos OpenFOAM por material.")
+    parser = argparse.ArgumentParser(description="Analiza resultados lagrangianos OpenFOAM por material (Clepsamia).")
     parser.add_argument("--cases-root", required=True, help="Directorio con subcasos por material.")
     parser.add_argument("--output", default=None, help="CSV resumen. Por defecto cases-root/particle_metrics.csv.")
     parser.add_argument(
         "--particles-csv",
         default=None,
         help="CSV con posiciones finales para ParaView. Por defecto cases-root/particles_latest.csv.",
-    )
-    parser.add_argument(
-        "--trap-margin-m",
-        type=float,
-        default=0.012,
-        help="Margen vertical sobre trap_height para considerar captura.",
-    )
-    parser.add_argument(
-        "--trap-radius-factor",
-        type=float,
-        default=2.0,
-        help="Factor sobre trap_bottom_radius para considerar captura en la trampa.",
     )
     return parser.parse_args()
 
@@ -97,20 +85,16 @@ def parse_last_fates(log_path: Path) -> dict[str, dict[str, int]]:
 def classify_position(
     position: tuple[float, float, float],
     manifest: dict[str, Any],
-    trap_margin_m: float,
-    trap_radius_factor: float,
 ) -> str:
+    """Clasifica una particula que sigue dentro del dispositivo segun su altura.
+    En la geometria Clepsamia hay solo dos zonas: lobulo superior y lobulo inferior,
+    separados por el cuello.
+    """
     x, y, z = position
-    radius = math.hypot(x, z)
-    trap_height = float(manifest["trap_height_m"])
-    trap_radius = float(manifest["trap_bottom_radius_m"])
-    overflow_radius = float(manifest["overflow_tube_radius_m"])
-    overflow_bottom = float(manifest["overflow_tube_bottom_height_m"])
-    if y <= trap_height + trap_margin_m and radius <= max(0.01, trap_radius_factor * trap_radius):
-        return "trapped_spatial"
-    if y >= overflow_bottom and radius <= max(0.015, 2.2 * overflow_radius):
-        return "overflow_zone"
-    return "in_device"
+    neck_height = float(manifest.get("neck_height_m", 0.0))
+    if y < neck_height:
+        return "in_lower_lobe"
+    return "in_upper_lobe"
 
 
 def material_case_dirs(cases_root: Path) -> list[Path]:
@@ -121,26 +105,26 @@ def material_case_dirs(cases_root: Path) -> list[Path]:
     )
 
 
-def analyze_case(
-    case_dir: Path,
-    trap_margin_m: float,
-    trap_radius_factor: float,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def analyze_case(case_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     manifest = json.loads((case_dir / "particle_manifest.json").read_text(encoding="utf-8"))
     material = manifest["material"]
     latest_time, positions_path = latest_positions_file(case_dir)
     positions = read_positions(positions_path)
     fates = parse_last_fates(case_dir / "particleFoam.log")
-    overflow_patch = next((name for name in fates if name.endswith("_overflow_mouth")), "")
-    trap_patch = next((name for name in fates if name.endswith("_trap_floor")), "")
-    overflow_escape = fates.get(overflow_patch, {}).get("escape", 0)
-    trap_stick = fates.get(trap_patch, {}).get("stick", 0)
+    central_tube_patch = next((name for name in fates if name.endswith("_central_tube_top")), "")
+    inlet_patch = next((name for name in fates if name.endswith("_inlet")), "")
+    central_tube_escape = fates.get(central_tube_patch, {}).get("escape", 0)
+    inlet_escape = fates.get(inlet_patch, {}).get("escape", 0)
     initial_count = int(manifest["initial_count"])
 
+    # Calcular masa de una particula
+    volume_m3 = (4.0 / 3.0) * math.pi * (float(material["diameter_m"]) / 2.0) ** 3
+    particle_mass_kg = volume_m3 * float(material["density_kg_m3"])
+
     particle_rows: list[dict[str, Any]] = []
-    spatial_counts: dict[str, int] = {"trapped_spatial": 0, "overflow_zone": 0, "in_device": 0}
+    spatial_counts: dict[str, int] = {"in_lower_lobe": 0, "in_upper_lobe": 0}
     for idx, position in enumerate(positions):
-        status = classify_position(position, manifest, trap_margin_m, trap_radius_factor)
+        status = classify_position(position, manifest)
         spatial_counts[status] = spatial_counts.get(status, 0) + 1
         x, y, z = position
         particle_rows.append(
@@ -163,25 +147,31 @@ def analyze_case(
 
     remaining = len(positions)
     missing = max(0, initial_count - remaining)
-    trapped = max(trap_stick, spatial_counts["trapped_spatial"])
-    overflow = max(overflow_escape, spatial_counts["overflow_zone"], missing if overflow_escape else 0)
+    # Particulas que escaparon por el tubo central o por el inlet (atras) son consideradas salidas
+    escaped = max(central_tube_escape + inlet_escape, missing)
+    # Las que siguen dentro: idealmente el oro se queda en el lobulo inferior.
+    in_lower = spatial_counts["in_lower_lobe"]
+    in_upper = spatial_counts["in_upper_lobe"]
+
     summary = {
         "case": case_dir.name,
         "material": material["name"],
         "label": material["label"],
         "target": int(bool(material["target"])),
+        "particle_mass_kg": particle_mass_kg,
         "density_kg_m3": material["density_kg_m3"],
         "diameter_m": material["diameter_m"],
         "initial_count": initial_count,
         "latest_time": latest_time,
         "remaining_count": remaining,
-        "missing_count": missing,
-        "trapped_count": trapped,
-        "overflow_count": overflow,
-        "in_device_count": spatial_counts["in_device"],
-        "trapped_pct": 100.0 * trapped / max(1, initial_count),
-        "overflow_pct": 100.0 * overflow / max(1, initial_count),
-        "in_device_pct": 100.0 * spatial_counts["in_device"] / max(1, initial_count),
+        "escaped_count": escaped,
+        "in_lower_lobe_count": in_lower,
+        "in_upper_lobe_count": in_upper,
+        "central_tube_escape_count": central_tube_escape,
+        "inlet_escape_count": inlet_escape,
+        "escaped_pct": 100.0 * escaped / max(1, initial_count),
+        "in_lower_lobe_pct": 100.0 * in_lower / max(1, initial_count),
+        "in_upper_lobe_pct": 100.0 * in_upper / max(1, initial_count),
         "collision_model": manifest.get("collision_model", ""),
         "solver": manifest.get("solver", ""),
     }
@@ -189,18 +179,25 @@ def analyze_case(
 
 
 def combined_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
-    target_initial = sum(row["initial_count"] for row in rows if row["target"])
-    target_trapped = sum(row["trapped_count"] for row in rows if row["target"])
-    target_overflow = sum(row["overflow_count"] for row in rows if row["target"])
-    non_target_initial = sum(row["initial_count"] for row in rows if not row["target"])
-    non_target_trapped = sum(row["trapped_count"] for row in rows if not row["target"])
-    non_target_overflow = sum(row["overflow_count"] for row in rows if not row["target"])
-    total_trapped = target_trapped + non_target_trapped
+    """Metricas para Clepsamia:
+    - target_recovery_pct: oro retenido dentro del dispositivo (no escapo).
+    - target_loss_pct: oro que escapo por el tubo central o el inlet.
+    - non_target_rejection_pct: arena que SI escapo por el tubo central (deseado).
+    - trapped_contamination_pct: arena que se quedo dentro del dispositivo (no salio).
+    """
+    target_initial_mass = sum(row["initial_count"] * row["particle_mass_kg"] for row in rows if row["target"])
+    target_escaped_mass = sum(row["escaped_count"] * row["particle_mass_kg"] for row in rows if row["target"])
+    target_retained_mass = max(0.0, target_initial_mass - target_escaped_mass)
+
+    non_target_initial_mass = sum(row["initial_count"] * row["particle_mass_kg"] for row in rows if not row["target"])
+    non_target_escaped_mass = sum(row["escaped_count"] * row["particle_mass_kg"] for row in rows if not row["target"])
+    non_target_retained_mass = max(0.0, non_target_initial_mass - non_target_escaped_mass)
+
     return {
-        "target_recovery_pct": 100.0 * target_trapped / max(1, target_initial),
-        "target_loss_pct": 100.0 * target_overflow / max(1, target_initial),
-        "non_target_rejection_pct": 100.0 * non_target_overflow / max(1, non_target_initial),
-        "trapped_contamination_pct": 100.0 * non_target_trapped / max(1, total_trapped),
+        "target_recovery_pct": 100.0 * target_retained_mass / max(1e-12, target_initial_mass),
+        "target_loss_pct": 100.0 * target_escaped_mass / max(1e-12, target_initial_mass),
+        "non_target_rejection_pct": 100.0 * non_target_escaped_mass / max(1e-12, non_target_initial_mass),
+        "trapped_contamination_pct": 100.0 * non_target_retained_mass / max(1e-12, target_retained_mass + non_target_retained_mass),
     }
 
 
@@ -222,7 +219,7 @@ def main() -> None:
     summaries: list[dict[str, Any]] = []
     particles: list[dict[str, Any]] = []
     for case_dir in material_case_dirs(cases_root):
-        summary, particle_rows = analyze_case(case_dir, args.trap_margin_m, args.trap_radius_factor)
+        summary, particle_rows = analyze_case(case_dir)
         summaries.append(summary)
         particles.extend(particle_rows)
     write_csv(output, summaries)
